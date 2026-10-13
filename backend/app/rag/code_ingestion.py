@@ -40,6 +40,26 @@ import os as _os
 BATCH_SIZE = int(_os.getenv("CODE_INGEST_BATCH_SIZE", "256"))
 MAX_CHUNK_CHARS = 6000   # ~1500 tokens — fits comfortably in context window
 
+from collections.abc import Callable
+
+# Coarse progress reporting for the multi-hour admin ingest. The REST index
+# job passes a callback that writes (stage, pct) onto the agent_jobs row —
+# each write bumps `updated_at`, which is what the R-9 orphan sweeper reads
+# to tell a live ingest from a dead one. Milestones therefore double as the
+# job's liveness signal, not just UI decoration.
+ProgressFn = Callable[[str, "int | None"], None]
+
+
+def _notify(on_progress: ProgressFn | None, stage: str, pct: int | None = None) -> None:
+    """Report an ingest milestone to the caller. Must never raise — a broken
+    progress sink cannot be allowed to sink the ingest itself."""
+    if on_progress is None:
+        return
+    try:
+        on_progress(stage, pct)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("ingest on_progress callback failed: %s", e)
+
 
 # ── GitLab fetching ────────────────────────────────────────────────────────────
 
@@ -945,6 +965,8 @@ def ingest_repo(
     repo: str,
     branch: str,
     gitlab_url: str | None = None,
+    *,
+    on_progress: ProgressFn | None = None,
 ) -> dict:
     """
     Fetch Java source files from a GitLab repo and store embeddings (global admin indexing).
@@ -958,19 +980,10 @@ def ingest_repo(
     if not repo:
         raise ValueError("GitLab repo path is required.")
 
-    # Remove existing chunks for this repo (allow re-indexing)
-    existing = (
-        db.query(DocumentChunk)
-        .filter(DocumentChunk.doc_category == DocCategory.JAVA_SOURCE)
-        .filter(DocumentChunk.metadata_["repo_id"].as_string() == repo_id)
-        .all()
-    )
-    for d in existing:
-        db.delete(d)
-    db.flush()
-    logger.info("Code indexing: cleared %d existing chunks for repo_id=%s", len(existing), repo_id)
-
-    # Use custom gitlab_url if provided, else global
+    # Fetch FIRST, clear the old index only once the fetch proves non-empty.
+    # The previous order (clear → fetch) meant any failed/empty fetch — wrong
+    # branch, token without repository access, rate-limited per-file fallback —
+    # wiped a previously-good index and left the repo showing 0 files/0 chunks.
     original_url = settings.gitlab_url
     if gitlab_url:
         settings.__dict__["gitlab_url"] = gitlab_url
@@ -982,10 +995,24 @@ def ingest_repo(
             settings.__dict__["gitlab_url"] = original_url
 
     if not java_files:
-        logger.warning("No Java files returned from GitLab for repo=%s branch=%s", repo, branch)
-        return {"files_fetched": 0, "chunks_stored": 0}
+        logger.warning("No Java files returned from GitLab for repo=%s branch=%s "
+                       "— existing index left untouched", repo, branch)
+        return {"files_fetched": 0, "chunks_stored": 0, "index_preserved": True}
 
     logger.info("Code indexing: fetched %d Java files from %s/%s", len(java_files), repo, branch)
+    _notify(on_progress, f"Fetched {len(java_files)} files — clearing old index", 10)
+
+    # Remove existing chunks for this repo (allow re-indexing)
+    existing = (
+        db.query(DocumentChunk)
+        .filter(DocumentChunk.doc_category == DocCategory.JAVA_SOURCE)
+        .filter(DocumentChunk.metadata_["repo_id"].as_string() == repo_id)
+        .all()
+    )
+    for d in existing:
+        db.delete(d)
+    db.flush()
+    logger.info("Code indexing: cleared %d existing chunks for repo_id=%s", len(existing), repo_id)
 
     # Chunk all files — dispatcher falls back to regex when feature flag is off.
     all_chunks: list[dict] = []
@@ -1002,14 +1029,19 @@ def ingest_repo(
         all_chunks.extend(file_chunks)
 
     logger.info("Code indexing: %d chunks after splitting", len(all_chunks))
+    _notify(on_progress, f"Chunked {len(java_files)} files → {len(all_chunks)} chunks", 20)
 
     # Optional 3-view expansion (body / signature / nl_summary).
+    if settings.use_code_multiview_embedding:
+        # The longest silent phase (~55 min for a 13k-symbol repo) — announce it.
+        _notify(on_progress, f"Generating NL summaries for {len(all_chunks)} chunks (multiview)", 22)
     all_chunks = _expand_multiview_if_enabled(all_chunks)
     all_chunks = _expand_per_window_if_enabled(all_chunks)
     logger.info("Code indexing: %d chunks after multiview expansion", len(all_chunks))
 
     # Embed + store in batches
     total_stored = 0
+    total_chunks = len(all_chunks)
     for batch_start in range(0, len(all_chunks), BATCH_SIZE):
         batch = all_chunks[batch_start: batch_start + BATCH_SIZE]
         # Consult the content-hash embedding cache before
@@ -1053,6 +1085,13 @@ def ingest_repo(
             total_stored += 1
 
         db.flush()
+        # Per-batch milestone — the embed phase dominates wall-time on big
+        # repos, and these writes are what keeps the job's updated_at moving.
+        _notify(
+            on_progress,
+            f"Embedding + storing chunks {total_stored}/{total_chunks}",
+            25 + int(70 * total_stored / max(total_chunks, 1)),
+        )
 
     db.commit()
     logger.info("Code indexing: stored %d chunks for repo=%s repo_id=%s", total_stored, repo, repo_id)
@@ -1085,6 +1124,7 @@ def ingest_polyglot_repo(
     *,
     languages: list[str],
     gitlab_url: str | None = None,
+    on_progress: ProgressFn | None = None,
 ) -> dict:
     """Polyglot version of `ingest_repo` — fetch files for the given list of
     languages, dispatch chunker + symbol-graph attach by language, and store
@@ -1123,6 +1163,27 @@ def ingest_polyglot_repo(
         "javascript": "javascript_source",
     }
 
+    # Fetch FIRST, clear the old index only once the fetch proves non-empty.
+    # The previous order (clear → fetch) meant any failed/empty fetch — wrong
+    # branch, token without repository access, rate-limited per-file fallback —
+    # wiped a previously-good index and left the repo showing 0 files/0 chunks.
+    original_url = settings.gitlab_url
+    if gitlab_url:
+        settings.__dict__["gitlab_url"] = gitlab_url
+    try:
+        files = _fetch_files_by_extensions(repo, branch, extensions)
+    finally:
+        if gitlab_url:
+            settings.__dict__["gitlab_url"] = original_url
+
+    if not files:
+        logger.warning("Polyglot indexing: no files matched languages=%s in %s/%s "
+                       "— existing index left untouched", languages, repo, branch)
+        return {"files_fetched": 0, "chunks_stored": 0, "by_language": {},
+                "index_preserved": True}
+
+    _notify(on_progress, f"Fetched {len(files)} files — clearing old index", 10)
+
     # Clear existing chunks for this repo across ALL covered categories so
     # re-indexing is idempotent.
     cats_to_clear = sorted({category_for.get(l, l) for l in languages})
@@ -1139,21 +1200,6 @@ def ingest_polyglot_repo(
         "Polyglot indexing: cleared %d existing chunks for repo_id=%s langs=%s",
         len(existing), repo_id, languages,
     )
-
-    # Fetch files
-    original_url = settings.gitlab_url
-    if gitlab_url:
-        settings.__dict__["gitlab_url"] = gitlab_url
-    try:
-        files = _fetch_files_by_extensions(repo, branch, extensions)
-    finally:
-        if gitlab_url:
-            settings.__dict__["gitlab_url"] = original_url
-
-    if not files:
-        logger.warning("Polyglot indexing: no files matched languages=%s in %s/%s",
-                       languages, repo, branch)
-        return {"files_fetched": 0, "chunks_stored": 0, "by_language": {}}
 
     # Chunk + symbol-graph attach per file, dispatching by language.
     all_chunks: list[dict] = []
@@ -1186,6 +1232,9 @@ def ingest_polyglot_repo(
         all_chunks.extend([{**c, "_lang": lang} for c in file_chunks])
 
     logger.info("Polyglot indexing: %d chunks before multiview", len(all_chunks))
+    _notify(on_progress, f"Chunked {len(files)} files → {len(all_chunks)} chunks", 20)
+    if settings.use_python_lsp or settings.use_typescript_lsp or settings.use_java_lsp:
+        _notify(on_progress, "Resolving cross-file references (LSP)", 21)
 
     # Python LSP cross-file resolution. Runs AFTER per-file symbol
     # graphs are attached (so we know within-file `calls` lists) but BEFORE
@@ -1254,6 +1303,9 @@ def ingest_polyglot_repo(
         except Exception as e:
             logger.warning("Java LSP resolution failed (non-fatal): %s", e)
 
+    if settings.use_code_multiview_embedding:
+        # The longest silent phase (~55 min for a 13k-symbol repo) — announce it.
+        _notify(on_progress, f"Generating NL summaries for {len(all_chunks)} chunks (multiview)", 22)
     all_chunks = _expand_multiview_if_enabled(all_chunks)
     all_chunks = _expand_per_window_if_enabled(all_chunks)
     logger.info("Polyglot indexing: %d chunks after multiview expansion", len(all_chunks))
@@ -1261,6 +1313,7 @@ def ingest_polyglot_repo(
     # Embed + store
     by_language_stored: dict[str, int] = {}
     total_stored = 0
+    total_chunks = len(all_chunks)
     for batch_start in range(0, len(all_chunks), BATCH_SIZE):
         batch = all_chunks[batch_start: batch_start + BATCH_SIZE]
         # Consult the content-hash embedding cache before
@@ -1308,6 +1361,13 @@ def ingest_polyglot_repo(
             by_language_stored[lang] = by_language_stored.get(lang, 0) + 1
 
         db.flush()
+        # Per-batch milestone — the embed phase dominates wall-time on big
+        # repos, and these writes are what keeps the job's updated_at moving.
+        _notify(
+            on_progress,
+            f"Embedding + storing chunks {total_stored}/{total_chunks}",
+            25 + int(70 * total_stored / max(total_chunks, 1)),
+        )
 
     db.commit()
     logger.info(
@@ -1522,6 +1582,7 @@ def ingest_polyglot_repo_incremental(
     *,
     languages: list[str],
     gitlab_url: str | None = None,
+    on_progress: ProgressFn | None = None,
 ) -> dict:
     """Polyglot ingest with file-hash-based delta processing.
 
@@ -1609,17 +1670,12 @@ def ingest_polyglot_repo_incremental(
             added = diff["added"]
             modified = diff["modified"]
             unchanged: list[dict] = []   # not meaningful in fast path
-            # TODO(— BUG flagged in review, NOT fixed on retrofit):
-            # `files` here is ONLY the compare-changed files, so
-            # diff_against_state computes deleted = prior_state.keys() - {those
-            # few files} = EVERY unchanged file in the repo. ORing that into
-            # `deleted` makes the fast path wipe the entire index (chunks +
-            # file-state) on the first real changed-commit run. Deletions are
-            # already authoritative in `deleted_from_compare` — use only that:
-            #   deleted = sorted(deleted_from_compare)
-            # and add a fast-path test (prior_state full, files=1 modified →
-            # deleted == []).
-            deleted = sorted(set(diff["deleted"]) | set(deleted_from_compare))
+            # Deletions come from the Compare API ONLY. `files` here is just
+            # the compare-changed subset, so diff_against_state's `deleted`
+            # (prior_state keys absent from `files`) is every UNCHANGED file
+            # in the repo — ORing that in wiped the entire index (chunks +
+            # file-state) on the first real changed-commit run.
+            deleted = sorted(deleted_from_compare)
             logger.info(
                 "Incremental fast path: compare(%s..%s) drove the delta",
                 (prev_sha or "")[:12], (new_sha or "")[:12],
@@ -1646,6 +1702,8 @@ def ingest_polyglot_repo_incremental(
         "Incremental ingest: repo_id=%s added=%d modified=%d unchanged=%d deleted=%d",
         repo_id, len(added), len(modified), len(unchanged), len(deleted),
     )
+    _notify(on_progress,
+            f"Delta: {len(added)} added, {len(modified)} modified, {len(deleted)} deleted", 15)
 
     # 4. Delete chunks for files removed from the repo.
     chunks_deleted = _delete_chunks_for_files(
@@ -1754,6 +1812,7 @@ def ingest_polyglot_repo_incremental(
     # 7. Embed + persist (delta only).
     by_language_stored: dict[str, int] = {}
     chunks_inserted = 0
+    total_chunks = len(all_chunks)
     for batch_start in range(0, len(all_chunks), BATCH_SIZE):
         batch = all_chunks[batch_start: batch_start + BATCH_SIZE]
         # Consult the content-hash embedding cache before
@@ -1797,6 +1856,13 @@ def ingest_polyglot_repo_incremental(
             chunks_inserted += 1
             by_language_stored[lang] = by_language_stored.get(lang, 0) + 1
         db.flush()
+        # Per-batch milestone — the embed phase dominates wall-time on big
+        # repos, and these writes are what keeps the job's updated_at moving.
+        _notify(
+            on_progress,
+            f"Embedding + storing chunks {chunks_inserted}/{total_chunks}",
+            25 + int(70 * chunks_inserted / max(total_chunks, 1)),
+        )
 
     # 8. Persist updated file state for delta files.
     _persist_file_state(db, repo_id, delta_files)

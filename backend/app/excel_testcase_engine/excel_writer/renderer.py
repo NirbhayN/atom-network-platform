@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -26,8 +27,15 @@ from app.excel_testcase_engine.schemas.workbook_plan import WorkbookPlan
 from . import recalc_helper, repair
 
 
+# Excel forbids \ / ? * : [ ] in sheet titles and caps them at 31 chars;
+# openpyxl raises ValueError on either. Sheet names arrive from the
+# LLM-generated WorkbookPlan, so they must be sanitized, not trusted.
+_INVALID_SHEET_CHARS = re.compile(r"[\\/*?:\[\]]")
+
+
 def _safe_title(name: str) -> str:
-    return name[:31]
+    cleaned = _INVALID_SHEET_CHARS.sub("-", name).strip("'").strip()
+    return (cleaned or "Sheet")[:31]
 
 
 def render(plan: WorkbookPlan, output_path: Path) -> Path:

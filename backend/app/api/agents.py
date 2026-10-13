@@ -3160,20 +3160,28 @@ async def ws_tech_spec(websocket: WebSocket, change_id: str):
                 # docgen pipeline (write_content), not model-generated. Registry misses
                 # simply fall back to the existing LLM interface_spec behaviour.
                 #
-                # The CORE set derives from RATIFIED/stable inputs only — approved XSD,
-                # involved-schema bundle, ratified flow spec. LLM proposals are excluded:
-                # they vary run-to-run and made the TSD's registry-section set
-                # nondeterministic (QA finding I2). Any registry API the writer merely
-                # MENTIONS is swept in post-write by the pipeline (QA finding I1), so
+                # The CORE set derives from RATIFIED/stable inputs only — approved XSD
+                # and ratified flow spec. LLM proposals are excluded: they vary
+                # run-to-run and made the TSD's registry-section set nondeterministic
+                # (QA finding I2). The involved-XSD bundle is deliberately NOT scanned:
+                # it carries include/import GRAPH NEIGHBOURS of the changed schemas as
+                # grounding context, and scanning it promoted every neighbouring API to
+                # a full spec section — the TSD read as an all-platform API dump instead
+                # of this feature's surface. A registry API the writer merely MENTIONS
+                # is cross-referenced (not expanded) post-write by the pipeline, so
                 # every generated doc satisfies the registry eval check by construction.
                 try:
                     from app.services.api_registry_ingest import (
-                        derive_involved_api_names, registry_specs_all)
+                        complete_message_pairs, derive_involved_api_names,
+                        registry_specs_all)
                     _all_specs = registry_specs_all(db)
-                    _core = [n for n in derive_involved_api_names(
-                        _tsd_xsd, _tsd_xsd_bundle,
+                    # Pair completion: a flow that names ReqX commits the TSD to
+                    # RespX too (and vice versa) — every message of every exchange
+                    # in this feature's flow gets its full registry section.
+                    _core = complete_message_pairs([n for n in derive_involved_api_names(
+                        _tsd_xsd,
                         json.dumps(state.get("source_flow_spec") or {}, default=str),
-                    ) if n in _all_specs]
+                    ) if n in _all_specs], _all_specs)
                     state["api_registry_specs_by_name"] = _all_specs
                     state["api_registry_core_names"] = _core
                     if _core:

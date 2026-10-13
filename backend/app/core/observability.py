@@ -362,38 +362,68 @@ def _persist_usage_row(trace: "LlmCallTrace") -> None:
         logger.debug("usage ledger write skipped: %s", e)
 
 
-def get_cumulative_run_tokens(run_id: str) -> int:
-    """Sum of input+output+cache tokens persisted so far for one agentic run.
+# Cost weights for the run budget guard. Anthropic bills cache READS at ~10% of
+# the input price and cache WRITES at 125%; counting both at full weight inflated
+# measured spend ~140× on warm-cache runs — the ledger of run a5f489f8 showed
+# 99.3% of a "4.2M-token" run was cache reads of the same ~65k prefix, while the
+# cost-weighted spend was ~1.27M. The flat sum killed healthy runs at the 4M cap
+# (see wiki/tasks/token-budget-cache-token-weighting.md).
+CACHE_READ_WEIGHT = 0.1
+CACHE_WRITE_WEIGHT = 1.25
 
-    Backs the A6 (architecture review High #5) per-run token budget guard in
-    `agents/agentic_runtime.py`. Queries the durable `llm_usage_records`
-    ledger rather than an in-process counter, so the budget is enforced
-    across ALL phases/drives of a run (analysis, code, review, verification
-    fix loops) — not just the current loop invocation's in-memory total,
-    which resets every time `run_agent_loop` is re-entered. Best-effort:
-    returns 0 (never raises) on any DB error so a ledger hiccup cannot
-    itself abort a run — the caller should treat 0 as "unknown, do not
-    enforce this cycle" rather than "definitely zero spend"."""
+
+def get_run_token_breakdown(run_id: str) -> dict:
+    """Per-kind token sums + the cost-weighted total for one agentic run.
+
+    Queries the durable `llm_usage_records` ledger rather than an in-process
+    counter, so the budget is enforced across ALL phases/drives of a run
+    (analysis, code, review, verification fix loops) — not just the current
+    loop invocation's in-memory total, which resets every time
+    `run_agent_loop` is re-entered. Best-effort: returns all-zeros (never
+    raises) on any DB error so a ledger hiccup cannot itself abort a run —
+    the caller should treat 0 as "unknown, do not enforce this cycle" rather
+    than "definitely zero spend"."""
+    zeros = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_tokens": 0, "cache_write_tokens": 0, "weighted_total": 0}
     try:
         from sqlalchemy import func, select
         from app.core.database import SessionLocal
         from app.models.agentic import LlmUsageRecord
         db = SessionLocal()
         try:
-            total = db.scalar(
+            totals = db.execute(
                 select(
-                    func.coalesce(func.sum(
-                        LlmUsageRecord.input_tokens + LlmUsageRecord.output_tokens
-                        + LlmUsageRecord.cache_read_tokens + LlmUsageRecord.cache_write_tokens
-                    ), 0)
+                    func.coalesce(func.sum(LlmUsageRecord.input_tokens), 0),
+                    func.coalesce(func.sum(LlmUsageRecord.output_tokens), 0),
+                    func.coalesce(func.sum(LlmUsageRecord.cache_read_tokens), 0),
+                    func.coalesce(func.sum(LlmUsageRecord.cache_write_tokens), 0),
                 ).where(LlmUsageRecord.run_id == run_id)
-            )
-            return int(total or 0)
+            ).one()
         finally:
             db.close()
+        inp, out, cread, cwrite = (int(x or 0) for x in totals)
+        return {
+            "input_tokens": inp, "output_tokens": out,
+            "cache_read_tokens": cread, "cache_write_tokens": cwrite,
+            "weighted_total": int(inp + out
+                                  + CACHE_READ_WEIGHT * cread
+                                  + CACHE_WRITE_WEIGHT * cwrite),
+        }
     except Exception as e:  # noqa: BLE001 — telemetry read must never break the loop
         logger.debug("cumulative run-token read skipped: %s", e)
-        return 0
+        return dict(zeros)
+
+
+def get_cumulative_run_tokens(run_id: str) -> int:
+    """COST-WEIGHTED token total persisted so far for one agentic run.
+
+    Backs the A6 (architecture review High #5) per-run token budget guard in
+    `agents/agentic_runtime.py` and the drive-entry budget preflight in
+    `agents/agentic_orchestrator.py`. Cache tokens are weighted at their real
+    billing ratios (see CACHE_READ_WEIGHT / CACHE_WRITE_WEIGHT above) so the
+    cap measures spend, not cache traffic — a flat sum counted the same cached
+    prefix at full weight on every call and stopped healthy runs."""
+    return int(get_run_token_breakdown(run_id)["weighted_total"])
 
 
 def _schedule_usage_persist(trace: "LlmCallTrace") -> None:

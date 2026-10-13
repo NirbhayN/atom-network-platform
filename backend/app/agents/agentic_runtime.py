@@ -800,6 +800,65 @@ async def run_agent_loop(
             except Exception:  # noqa: BLE001 — a checkpoint hiccup must not break the loop
                 pass
 
+        # A6 (architecture review High #5) — per-run token budget guard, re-enforced.
+        # `agentic_max_tokens_per_run` (the OLD cap) was deliberately disabled because
+        # it killed legitimate large changes on a per-LOOP-INVOCATION counter that reset
+        # every phase. This checks the DURABLE cross-phase ledger total instead (every
+        # drive, every phase, every fix round of THIS run_id), so a genuinely
+        # non-converging run is caught even if no single phase looks expensive.
+        # Checked BEFORE the call (it used to run post-turn): a (re)entered loop that
+        # is already over budget now stops at ZERO marginal cost — each futile resume
+        # used to pay for one more turn (~21k tokens) before the post-turn guard
+        # re-fired. The total is COST-WEIGHTED (cache reads ≈10%, writes ≈125% of
+        # input price — see observability.get_run_token_breakdown): a flat sum
+        # re-counted the same cached prefix at full weight on every call and stopped
+        # healthy runs ~140× below their real spend. Soft-stop: the run ends with
+        # stopped="budget_exceeded" (resumable — an operator can raise
+        # agentic_token_budget_hard_cap and re-drive) rather than raising mid-turn,
+        # which would risk leaving on-disk edits in a half-written state.
+        _budget_cap = int(getattr(settings, "agentic_token_budget_hard_cap", 0) or 0)
+        if _budget_cap > 0:
+            from app.core.observability import get_run_token_breakdown
+            _bd = get_run_token_breakdown(run_id)
+            _run_total = _bd["weighted_total"]
+            _warn_frac = float(getattr(settings, "agentic_token_budget_warn_fraction", 0.8))
+            if _run_total >= _budget_cap and getattr(settings, "agentic_token_budget_enforce", True):
+                logger.error("agent_loop[%s] run=%s TOKEN BUDGET EXCEEDED: weighted %d >= cap %d "
+                             "(in=%d out=%d cache_read=%d cache_write=%d) — stopping before the "
+                             "next call (resumable with a raised budget)",
+                             agent_name, run_id, _run_total, _budget_cap,
+                             _bd["input_tokens"], _bd["output_tokens"],
+                             _bd["cache_read_tokens"], _bd["cache_write_tokens"])
+                _emit("token_budget_exceeded",
+                      {"iteration": i, "cumulative_run_tokens": _run_total,
+                       "hard_cap": _budget_cap,
+                       "breakdown": {k: _bd[k] for k in ("input_tokens", "output_tokens",
+                                                         "cache_read_tokens", "cache_write_tokens")},
+                       "action": f"⛔ Run token budget exhausted ({_run_total:,}/{_budget_cap:,} "
+                                 "cost-weighted) — stopping to avoid unbounded spend. Raise "
+                                 "AGENTIC_TOKEN_BUDGET_HARD_CAP and resume if this run needs more."})
+                git_guard.reset_policy(_guard_tok)
+                return RuntimeResult(final_text, ctx.changeset(), ctx.plan, i,
+                                     "budget_exceeded", messages,
+                                     read_files=sorted(ctx.read_files), facts=ctx.facts,
+                                     intel_queried=sorted(ctx.intel_queried),
+                                     schema_amendments=list(
+                                         (getattr(ctx, "schema_amendments", None) or {}).values()))
+            elif _run_total >= _budget_cap * _warn_frac and not getattr(ctx, "_budget_warned", False):
+                ctx._budget_warned = True
+                logger.warning("agent_loop[%s] run=%s token budget at %.0f%% (weighted %d/%d; "
+                               "in=%d out=%d cache_read=%d cache_write=%d)",
+                               agent_name, run_id, 100.0 * _run_total / _budget_cap,
+                               _run_total, _budget_cap,
+                               _bd["input_tokens"], _bd["output_tokens"],
+                               _bd["cache_read_tokens"], _bd["cache_write_tokens"])
+                _emit("token_budget_warning",
+                      {"iteration": i, "cumulative_run_tokens": _run_total, "hard_cap": _budget_cap,
+                       "breakdown": {k: _bd[k] for k in ("input_tokens", "output_tokens",
+                                                         "cache_read_tokens", "cache_write_tokens")},
+                       "action": f"⚠ Run token spend at {100.0 * _run_total / _budget_cap:.0f}% of budget "
+                                 f"({_run_total:,}/{_budget_cap:,} cost-weighted)"})
+
         # Preflight overflow check (P1): the post-turn trigger below sees only what the LAST
         # call reported — a burst of huge tool results appended since then can push the NEXT
         # request over the window and 400 it. Estimate the pending input (usage anchor + new
@@ -976,49 +1035,8 @@ async def run_agent_loop(
         # unless AGENTIC_DUMP_TRANSCRIPTS is on.
         _dump_transcript(run_id, agent_name, i, system, messages, tools, turn)
 
-        # A6 (architecture review High #5) — per-run token budget guard, re-enforced.
-        # `agentic_max_tokens_per_run` (the OLD cap) was deliberately disabled because
-        # it killed legitimate large changes on a per-LOOP-INVOCATION counter that reset
-        # every phase. This checks the DURABLE cross-phase ledger total instead (every
-        # drive, every phase, every fix round of THIS run_id), so a genuinely
-        # non-converging run is caught even if no single phase looks expensive.
-        # Soft-stop: the run ends with stopped="budget_exceeded" (resumable — an
-        # operator can raise agentic_token_budget_hard_cap and re-drive) rather than
-        # raising mid-turn, which would risk leaving on-disk edits in a half-written
-        # state. Checked every iteration (cheap: an indexed SUM query) rather than only
-        # at phase boundaries, so a single runaway phase cannot blow through the whole
-        # budget before the guard has a chance to fire.
-        _budget_cap = int(getattr(settings, "agentic_token_budget_hard_cap", 0) or 0)
-        if _budget_cap > 0:
-            from app.core.observability import get_cumulative_run_tokens
-            _run_total = get_cumulative_run_tokens(run_id)
-            _warn_frac = float(getattr(settings, "agentic_token_budget_warn_fraction", 0.8))
-            if _run_total >= _budget_cap and getattr(settings, "agentic_token_budget_enforce", True):
-                logger.error("agent_loop[%s] run=%s TOKEN BUDGET EXCEEDED: %d >= cap %d — "
-                             "stopping (resumable with a raised budget)",
-                             agent_name, run_id, _run_total, _budget_cap)
-                _emit("token_budget_exceeded",
-                      {"iteration": i, "cumulative_run_tokens": _run_total,
-                       "hard_cap": _budget_cap,
-                       "action": f"⛔ Run token budget exhausted ({_run_total:,}/{_budget_cap:,}) — "
-                                 "stopping to avoid unbounded spend. Raise "
-                                 "AGENTIC_TOKEN_BUDGET_HARD_CAP and resume if this run needs more."})
-                git_guard.reset_policy(_guard_tok)
-                return RuntimeResult(final_text, ctx.changeset(), ctx.plan, i,
-                                     "budget_exceeded", messages,
-                                     read_files=sorted(ctx.read_files), facts=ctx.facts,
-                                     intel_queried=sorted(ctx.intel_queried),
-                                     schema_amendments=list(
-                                         (getattr(ctx, "schema_amendments", None) or {}).values()))
-            elif _run_total >= _budget_cap * _warn_frac and not getattr(ctx, "_budget_warned", False):
-                ctx._budget_warned = True
-                logger.warning("agent_loop[%s] run=%s token budget at %.0f%% (%d/%d)",
-                               agent_name, run_id, 100.0 * _run_total / _budget_cap,
-                               _run_total, _budget_cap)
-                _emit("token_budget_warning",
-                      {"iteration": i, "cumulative_run_tokens": _run_total, "hard_cap": _budget_cap,
-                       "action": f"⚠ Run token spend at {100.0 * _run_total / _budget_cap:.0f}% of budget "
-                                 f"({_run_total:,}/{_budget_cap:,})"})
+        # (The per-run token budget guard runs at the TOP of this loop, before the
+        # LLM call — see the A6 block above the preflight overflow check.)
         # Context-window management (Claude-Code style) — we NEVER fail on token spend. When the
         # input the model just received approaches its context WINDOW (real token usage), or — when
         # a provider strips usage — when accumulated tool output passes the char fallback, COMPACT

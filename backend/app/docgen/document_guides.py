@@ -1291,9 +1291,13 @@ TSD_BLUEPRINT = {
             ),
             "include_table": True,
             "table_fallback_profile": "field_spec",
-            "include_diagram": False,
+            "include_diagram": True,
             "diagram_type": "flowchart",
-            "diagram_description": "",
+            "diagram_description": (
+                "Component architecture for THIS change: the components the change adds or modifies, "
+                "their injection points into existing services, and the data stores/queues they touch "
+                "— from the ratified technical design, not a generic reference architecture."
+            ),
         },
         {
             "section_key": "data_model",

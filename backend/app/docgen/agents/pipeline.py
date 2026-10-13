@@ -1621,17 +1621,21 @@ def write_content(state: dict) -> dict:
             _reg_core = list(_reg_by_name)
         if _reg_by_name:
             _reg_names = ", ".join(sorted(_reg_by_name))
+            _core_names = ", ".join(_reg_core) if _reg_core else "(derived from mentions)"
             for _sec in sections_data:
                 if _sec.get("section_key") == "interface_spec":
                     _sec["content_instructions"] = (
                         _sec.get("content_instructions", "")
                         + " REGISTRY OVERRIDE: the platform API Registry holds the authoritative "
-                          f"per-field dictionaries and message XML for: {_reg_names}. A registry-rendered "
-                          "spec section is appended automatically for EVERY one of these APIs this "
-                          "document names anywhere. Do NOT write field dictionary tables or XML samples "
-                          "for ANY of them — list them in the Interfaces-in-Scope table with role/status "
-                          "and change narrative only; write full detail only for interfaces NOT in that "
-                          "list, and do not name registry APIs the flow does not actually touch."
+                          f"per-field dictionaries and message XML for: {_reg_names}. Full "
+                          "registry-rendered spec sections are appended automatically ONLY for the "
+                          f"APIs this feature actually touches ({_core_names}); any other registry "
+                          "API this document names is cross-referenced as reused-unchanged without "
+                          "its field table. Do NOT write field dictionary tables or XML samples "
+                          "for ANY registry API — list each one in the Interfaces-in-Scope table with "
+                          "role/status and change narrative only; write full detail only for interfaces "
+                          "NOT in the registry, and do not name registry APIs the flow does not "
+                          "actually touch."
                     )
         ratified_plan = state.get("ratified_plan") or ""
         def _write_one(idx_section: tuple[int, dict]) -> tuple[int, dict]:
@@ -1744,20 +1748,26 @@ def write_content(state: dict) -> dict:
             logger.warning("[write_content] API-name normalization skipped: %s", e)
         # Deterministic API-spec sections — rendered from API Registry rows, never by
         # the LLM (same rows in → identical tables out; immune to token-cap truncation).
-        # Final set = stable core + post-write sweep: any registry API the generated
-        # sections mention (prose, tables, code blocks — the same surface the eval
-        # check scans) gets its section too, so the doc is self-consistent with
-        # check_tsd_api_specs_registry_backed by construction. Inserted into BOTH the
-        # plan and the generated list at the SAME index: repair/validation align
+        # FULL field dictionaries render ONLY for the ratified core (the APIs this
+        # feature actually touches). Every OTHER registry API the generated sections
+        # mention (prose, tables, code blocks — the same surface the eval check scans)
+        # gets one cross-reference line in a "Referenced Wire APIs" section instead,
+        # so check_tsd_api_specs_registry_backed stays satisfied by construction
+        # without the TSD expanding into an all-platform API dump. Inserted into BOTH
+        # the plan and the generated list at the SAME index: repair/validation align
         # plan↔sections BY INDEX and compare lengths, so the two lists must stay parallel.
         try:
             if _reg_by_name:
                 from app.services.api_registry_ingest import (
-                    derive_involved_api_names, render_registry_sections, sections_scan_text)
+                    derive_involved_api_names, render_registry_reference_section,
+                    render_registry_sections, sections_scan_text, select_registry_api_scope)
                 _mentioned = derive_involved_api_names(sections_scan_text(generated_sections))
-                _extras = sorted(n for n in _mentioned if n in _reg_by_name and n not in _reg_core)
-                _final_names = _reg_core + _extras
-                _reg_sections = render_registry_sections([_reg_by_name[n] for n in _final_names])
+                _full_names, _referenced = select_registry_api_scope(
+                    _reg_core, _mentioned, _reg_by_name)
+                _reg_sections = render_registry_sections([_reg_by_name[n] for n in _full_names])
+                _ref_section = render_registry_reference_section(_referenced)
+                if _ref_section:
+                    _reg_sections.append(_ref_section)
                 _plan_secs = plan.setdefault("sections", [])
                 _idx = next((i for i, s in enumerate(generated_sections)
                              if s.get("section_key") == "interface_spec"),
@@ -1765,7 +1775,7 @@ def write_content(state: dict) -> dict:
                 _plan_entries = [{
                     "section_key": s["section_key"], "heading": s["section_heading"],
                     "level": s.get("level", 2), "render_style": "body",
-                    "include_table": True, "include_diagram": False,
+                    "include_table": bool(s.get("table_data")), "include_diagram": False,
                     "content_instructions": "Rendered deterministically from the API Registry.",
                 } for s in _reg_sections]
                 generated_sections[_idx + 1:_idx + 1] = _reg_sections
@@ -1773,8 +1783,9 @@ def write_content(state: dict) -> dict:
                     _plan_secs[_idx + 1:_idx + 1] = _plan_entries
                 else:
                     _plan_secs.extend(_plan_entries)
-                logger.info("[write_content] inserted %d registry-rendered API spec section(s)",
-                            len(_reg_sections))
+                logger.info("[write_content] inserted %d full registry API spec section(s)"
+                            " + %d reused-unchanged cross-reference(s)",
+                            len(_full_names), len(_referenced))
         except Exception as e:  # noqa: BLE001 — registry sections are additive, never fatal
             logger.warning("[write_content] registry section injection skipped: %s", e)
         # Assign stable per-block IDs so the surgical (patch-based) editor can

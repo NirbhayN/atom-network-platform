@@ -153,6 +153,29 @@ def _add_page_number(paragraph):
     run._r.append(fld_char_end)
 
 
+def _diagram_display_width(image_path: str, max_width_in: float = 6.5,
+                           max_height_in: float = 7.5):
+    """Display width for an embedded diagram, fitting the page BOTH ways.
+
+    Full usable width (6.5" inside 1" margins) is right for most diagrams, but
+    a blind fixed width breaks the extremes: a tall activity/class diagram
+    scaled to 6.5" wide can run past the page height, and a tiny PNG gets
+    blown up blurry. Cap the implied height at `max_height_in` (python-docx
+    preserves aspect when only width is given) and never upscale beyond 2x the
+    PNG's native 96-dpi size. Falls back to full width if the image can't be
+    inspected — exactly the old behaviour.
+    """
+    try:
+        from PIL import Image
+        with Image.open(image_path) as im:
+            w_px, h_px = im.size
+        aspect = w_px / max(h_px, 1)
+        width = min(max_width_in, max_height_in * aspect, 2.0 * (w_px / 96.0))
+        return Inches(max(width, 2.0))
+    except Exception:  # noqa: BLE001 — sizing is cosmetic, embedding must not fail
+        return Inches(max_width_in)
+
+
 def _set_paragraph_spacing(para, before: int = 0, after: int = 6, line_rule=None):
     pPr = para._p.get_or_add_pPr()
     spacing = OxmlElement("w:spacing")
@@ -872,7 +895,7 @@ class DocxBuilder:
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
             _set_paragraph_spacing(para, before=12, after=6)
             run = para.add_run()
-            run.add_picture(image_path, width=Inches(6.5))
+            run.add_picture(image_path, width=_diagram_display_width(image_path))
         except Exception as e:
             logger.warning("Could not embed image %s: %s", image_path, e)
             para = self.doc.add_paragraph()
@@ -907,7 +930,7 @@ class DocxBuilder:
         img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _set_paragraph_spacing(img_para, before=12, after=6)
         try:
-            img_para.add_run().add_picture(image_path, width=Inches(6.5))
+            img_para.add_run().add_picture(image_path, width=_diagram_display_width(image_path))
         except Exception as e:
             logger.warning("Could not embed image %s: %s", image_path, e)
             img_para.clear()

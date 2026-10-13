@@ -9,6 +9,8 @@
   PATCH  /api-registry/fields/{field_id}     — edit a field's documented constraints
   POST   /api-registry/ingest                — populate/refresh from XSDs (deterministic)
   POST   /api-registry/harvest-code          — attach tier-1 code-constraint evidence
+  POST   /api-registry/messages/{id}/generate — payload from the row constraints (CERT-5)
+  POST   /api-registry/validate              — judge raw XML against the live registry
 
 Reads are open to any logged-in user; mutations require admin. Human edits
 set ``updated_by``, which locks the row's canonical values against future
@@ -283,6 +285,75 @@ def ingest(payload: IngestRequest, db: DbDep, current: AdminUser):
             counts[k] = counts.get(k, 0) + v
     logger.info("api-registry ingest by %s from %s: %s", current.email, dirs, counts)
     return {"xsd_dir": "; ".join(str(d) for d in dirs), **counts}
+
+
+class EnrichDescriptionsRequest(_NulSafe):
+    api_names: list[str] | None = None  # None → every active message
+    overwrite: bool = False             # True → re-describe agent-written cells too
+
+
+@router.post("/enrich-descriptions")
+async def enrich_descriptions(payload: EnrichDescriptionsRequest, db: DbDep, current: AdminUser):
+    """Agent pass that fills empty Message Item (field description) cells in the
+    registry — the TSD tables render whatever lands here. Human-locked fields
+    are never touched; see services/api_registry_enrich.py for the contract."""
+    from app.services.api_registry_enrich import enrich_message_items
+
+    counts = await enrich_message_items(db, payload.api_names, payload.overwrite)
+    logger.info("api-registry description enrichment by %s (apis=%s overwrite=%s): %s",
+                current.email, payload.api_names or "ALL", payload.overwrite, counts)
+    return counts
+
+
+class GeneratePayloadRequest(_NulSafe):
+    """Inputs to the CERT-5 generator — every field optional: a bare POST
+    yields the mandatory-only payload with constraint-derived values."""
+    values: dict[str, str] | None = None      # full registry paths → literals
+    profile: dict[str, object] | None = None  # path/tail → literal or {"provider": name}
+    repeats: dict[str, int] | None = None     # element path → total copies
+    fault: dict[str, str] | None = None       # {"path": ..., "kind": ...}
+    include: str = Field("mandatory", pattern="^(mandatory|all)$")
+    self_check: bool = True                   # grade the output with the judge
+    xsd_check: bool = False                   # gate against the source .xsd file
+
+
+@router.post("/messages/{message_id}/generate")
+def generate_message_payload(message_id: str, payload: GeneratePayloadRequest,
+                             db: DbDep, _: CurrentUser):
+    """Read-only compute: nothing is persisted or sent — the caller (cert
+    harness, UI, or a curious human) gets the payload plus the honest report."""
+    from app.services.payload_generator import FaultNotApplicable, payload_for_message
+    from app.services.registry_validation import validate_against_fields, xsd_gate
+
+    m = db.get(ApiMessage, message_id)
+    if m is None:
+        raise HTTPException(status_code=404, detail="Unknown message")
+    try:
+        result = payload_for_message(
+            m, values=payload.values, profile=payload.profile,
+            repeats=payload.repeats, fault=payload.fault, include=payload.include)
+    except FaultNotApplicable as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    out = {"api_name": m.api_name, "xml": result.xml, "report": result.report}
+    if payload.self_check:
+        fields = [f for f in m.fields if f.status == "active"]
+        out["self_check"] = validate_against_fields(
+            result.xml, api_name=m.api_name, fields=fields)
+    if payload.xsd_check:
+        out["xsd_gate"] = xsd_gate(result.xml, m.source_schema_path)
+    return out
+
+
+class ValidatePayloadRequest(_NulSafe):
+    xml: str
+    api_name: str | None = None   # pin a message; default maps by root element
+
+
+@router.post("/validate")
+def validate_registry_payload(payload: ValidatePayloadRequest, db: DbDep, _: CurrentUser):
+    from app.services.registry_validation import validate_payload
+
+    return validate_payload(db, payload.xml, api_name=payload.api_name)
 
 
 @router.post("/harvest-code")

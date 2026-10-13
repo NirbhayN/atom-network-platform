@@ -488,9 +488,12 @@ def _api_name_in_doc_pattern():
 
 
 def check_tsd_api_specs_registry_backed(artifact: dict) -> list[str]:
-    """Every registry-covered wire API named in the TSD must carry its
-    registry-rendered spec section ("API Specification — <Name>"), not an
-    LLM-authored one. Fail-open when the registry/DB is unavailable.
+    """Every registry-covered wire API named in the TSD must carry EITHER its
+    registry-rendered spec section ("API Specification — <Name>") or the
+    pipeline's reused-unchanged cross-reference ("<Name>: reused unchanged") —
+    never an LLM-authored field dictionary. Full sections are scoped to the
+    feature's core APIs; the cross-reference covers registry APIs the flow
+    merely rides on. Fail-open when the registry/DB is unavailable.
     """
     tech_spec = _get_named_artifact(artifact, "tech_spec_document")
     text = tech_spec.get("content") or tech_spec.get("text") or ""
@@ -511,14 +514,19 @@ def check_tsd_api_specs_registry_backed(artifact: dict) -> list[str]:
                                ApiMessage.status == "active").all()}
     except Exception:  # noqa: BLE001 — registry check must never block eval itself
         return []
+    # Phrase kept in sync with api_registry_ingest.REFERENCED_API_MARKER.
     findings = []
     for name in sorted(covered):
-        if f"API Specification — {name}" not in text:
-            findings.append(
-                f"TSD references '{name}' which exists in the API Registry, but the "
-                f"registry-rendered spec section ('API Specification — {name}') is absent — "
-                "its field dictionary may be model-generated instead of registry-backed."
-            )
+        if f"API Specification — {name}" in text:
+            continue
+        if f"{name}: reused unchanged" in text:
+            continue
+        findings.append(
+            f"TSD references '{name}' which exists in the API Registry, but neither the "
+            f"registry-rendered spec section ('API Specification — {name}') nor the "
+            f"reused-unchanged cross-reference ('{name}: reused unchanged') is present — "
+            "its field dictionary may be model-generated instead of registry-backed."
+        )
     return findings[:10]
 
 

@@ -3,6 +3,8 @@
 
 """Admin Code Indexing API — manage GitLab repos and index Java source code into pgvector."""
 import logging
+import os
+import threading
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, field_validator
@@ -110,6 +112,97 @@ def _generate_module_context_parallel(
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── Job heartbeat ────────────────────────────────────────────────────────────
+
+HEARTBEAT_INTERVAL_S = float(os.getenv("CODE_INDEX_HEARTBEAT_SECONDS", "300"))
+
+
+class _JobHeartbeat:
+    """Keeps a long-running index job visibly alive for the R-9 orphan sweeper.
+
+    The sweeper (`jobs.sweep_orphan_jobs`, Celery beat every 30 min) fails any
+    RUNNING job whose `updated_at` is older than 90 minutes. `_run_index_job`
+    used to write the job row only at the start and the end, so any repo whose
+    ingest exceeded 90 minutes was reaped mid-flight — the same incident the
+    earlier 30→90 min threshold raise (see celery_tasks.py beat_schedule) tried
+    to outrun by widening the window. A heartbeat removes the race at any repo
+    size: `updated_at` moves every HEARTBEAT_INTERVAL_S while the ingest is
+    alive, and stops when the process dies, so the sweeper's contract (reap
+    dead jobs, spare live ones) actually holds.
+
+    Two write paths share one clock:
+      - the background beat thread fires every `interval_s` with the last
+        known stage (covers silent phases: archive download, LLM
+        summarization, LSP resolution);
+      - `progress(stage, pct)` — passed as `on_progress` into the ingest —
+        writes immediately AND becomes the stage the next beat repeats.
+
+    Every write opens its OWN short-lived session. The ingest session holds
+    the uncommitted delete+insert transaction, and `update_job` commits
+    whatever session it is handed — committing the ingest session mid-flight
+    would tear its all-or-nothing semantics.
+
+    `stop()` must be called BEFORE complete_job/fail_job so a late beat
+    cannot overwrite the terminal stage text.
+    """
+
+    def __init__(self, job_id: str, *, interval_s: float = HEARTBEAT_INTERVAL_S,
+                 touch_fn=None):
+        self._job_id = job_id
+        self._interval_s = interval_s
+        self._touch_fn = touch_fn or self._touch_via_own_session
+        self._stop_evt = threading.Event()
+        self._lock = threading.Lock()
+        self._stage: str | None = None
+        self._pct: int | None = None
+        self._thread = threading.Thread(
+            target=self._run, name=f"idx-heartbeat-{job_id[:8]}", daemon=True,
+        )
+
+    # touch_fn injection point exists for tests; production always goes
+    # through a fresh session.
+    def _touch_via_own_session(self, stage: str | None, pct: int | None) -> None:
+        hb_db = SessionLocal()
+        try:
+            job_registry.update_job(hb_db, self._job_id,
+                                    current_stage=stage, progress_pct=pct)
+        finally:
+            hb_db.close()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def progress(self, stage: str, pct: int | None = None) -> None:
+        """`on_progress` hook for the ingest — record + write through now."""
+        with self._lock:
+            self._stage = stage
+            if pct is not None:
+                self._pct = pct
+            stage_now, pct_now = self._stage, self._pct
+        if self._stop_evt.is_set():
+            return
+        self._safe_touch(stage_now, pct_now)
+
+    def _safe_touch(self, stage: str | None, pct: int | None) -> None:
+        try:
+            self._touch_fn(stage, pct)
+        except Exception as e:  # noqa: BLE001 — a broken heartbeat must never sink the ingest
+            logger.debug("[heartbeat %s] touch failed: %s", self._job_id, e)
+
+    def _run(self) -> None:
+        while not self._stop_evt.wait(self._interval_s):
+            with self._lock:
+                stage_now, pct_now = self._stage, self._pct
+            # update_job bumps updated_at even with stage=None/pct=None, so a
+            # beat before the first progress() call still counts as liveness.
+            self._safe_touch(stage_now, pct_now)
+
+
 def _run_index_job(
     *,
     job_id: str,
@@ -124,6 +217,7 @@ def _run_index_job(
     Failures are caught + recorded on the job row; nothing propagates.
     """
     worker_db = SessionLocal()
+    heartbeat: _JobHeartbeat | None = None
     try:
         repo = worker_db.get(CodeRepo, repo_id)
         if not repo:
@@ -143,9 +237,15 @@ def _run_index_job(
             job_id, mode, repo.gitlab_repo, repo.gitlab_branch, languages,
         )
 
+        # Keep the job row's updated_at moving for the whole ingest so the
+        # orphan sweeper spares it (see _JobHeartbeat). Milestones from the
+        # ingest write through heartbeat.progress; the beat covers the silent
+        # stretches in between.
+        heartbeat = _JobHeartbeat(job_id)
+        heartbeat.start()
+
         # Kick off module-wise context generation IN PARALLEL with the ingest
         # below — both fetch the repo independently and run at the same time.
-        import threading
         mc_result: dict = {}
         mc_thread = threading.Thread(
             target=_generate_module_context_parallel,
@@ -159,6 +259,7 @@ def _run_index_job(
                 db=worker_db, repo_id=repo_id,
                 repo=repo.gitlab_repo, branch=repo.gitlab_branch,
                 gitlab_url=repo.gitlab_url,
+                on_progress=heartbeat.progress,
             )
             files_fetched = result["files_fetched"]
             chunks_stored = result["chunks_stored"]
@@ -169,6 +270,7 @@ def _run_index_job(
                 repo=repo.gitlab_repo, branch=repo.gitlab_branch,
                 languages=languages or [],
                 gitlab_url=repo.gitlab_url,
+                on_progress=heartbeat.progress,
             )
             files_fetched = result["files_fetched"]
             chunks_stored = result["chunks_stored"]
@@ -182,6 +284,7 @@ def _run_index_job(
                 repo=repo.gitlab_repo, branch=repo.gitlab_branch,
                 languages=languages or [],
                 gitlab_url=repo.gitlab_url,
+                on_progress=heartbeat.progress,
             )
             files_fetched = result["files_fetched"]
             # Incremental returns inserts/deletes — the post-state chunks count
@@ -197,6 +300,7 @@ def _run_index_job(
                 "by_language":     result.get("by_language"),
             }
         else:
+            heartbeat.stop()
             job_registry.fail_job(
                 worker_db, job_id,
                 error=f"Unknown index mode {mode!r}",
@@ -209,6 +313,32 @@ def _run_index_job(
         # the job.
         mc_thread.join(timeout=settings.agentic_command_timeout_s + 30)
         extra["module_contexts"] = mc_result.get("modules", 0)
+
+        # Terminal writes from here — no beat may land after them.
+        heartbeat.stop()
+
+        # Empty fetch (java/polyglot full modes): the ingest preserved the
+        # existing index, so do NOT overwrite the repo stats with 0/0 — that
+        # made a fetch failure look like a successful empty index. Surface it
+        # on the job instead. (Incremental's 0-file case is a legit no-op.)
+        if files_fetched == 0 and mode != "polyglot-incremental":
+            job_registry.complete_job(
+                worker_db, job_id,
+                result={
+                    "repo_id":         repo_id,
+                    "mode":            mode,
+                    "files_fetched":   0,
+                    "chunks_stored":   0,
+                    "index_preserved": True,
+                    **extra,
+                },
+                final_stage=(
+                    "Fetched 0 files — existing index left unchanged. "
+                    "Check branch name, token access and selected languages."
+                ),
+            )
+            logger.warning("[index-job %s] fetch returned 0 files — repo stats untouched", job_id)
+            return
 
         job_registry.update_job(
             worker_db, job_id,
@@ -242,7 +372,12 @@ def _run_index_job(
         )
     except Exception as exc:
         logger.exception("[index-job %s] failed", job_id)
+        if heartbeat is not None:
+            heartbeat.stop()
         try:
+            # The worker session may hold a failed transaction — roll it back
+            # so the job-row write below runs on a clean session.
+            worker_db.rollback()
             job_registry.fail_job(
                 worker_db, job_id,
                 error=str(exc), final_stage="Indexing failed",
@@ -250,6 +385,8 @@ def _run_index_job(
         except Exception:
             pass
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         worker_db.close()
 
 
@@ -550,6 +687,35 @@ def remove_repo(repo_id: str, db: DbDep, _: AdminUser):
 
 # ── Indexing ──────────────────────────────────────────────────────────────────
 
+def _active_job_for_repo(db, repo_id: str) -> dict | None:
+    """Duplicate-trigger guard: the most recent active code-indexing job for
+    this repo, or None. Ingest runs are legitimately multi-hour (now kept
+    alive by the heartbeat), and a second concurrent run would delete the
+    first run's chunks mid-flight and race it on the repo stats row.
+
+    Best-effort — a guard failure must not block indexing (a real DB outage
+    surfaces in create_job immediately after anyway)."""
+    try:
+        active = job_registry.get_active_jobs(db, module="code_indexing")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("active-job guard skipped: %s", e)
+        return None
+    return next((j for j in active if j.get("subtype") == repo_id), None)
+
+
+def _reject_if_already_indexing(db, repo_id: str) -> None:
+    dup = _active_job_for_repo(db, repo_id)
+    if dup:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Indexing is already running for this repo "
+                f"(job {dup.get('id')}, stage: {dup.get('current_stage') or 'starting'}). "
+                "Wait for it to finish before starting another run."
+            ),
+        )
+
+
 @router.post("/repos/{repo_id}/index", status_code=202)
 def index_repo(
     repo_id: str,
@@ -567,6 +733,7 @@ def index_repo(
     repo = db.get(CodeRepo, repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
+    _reject_if_already_indexing(db, repo_id)
 
     job_id = job_registry.create_job(
         db,
@@ -624,6 +791,7 @@ def index_repo_polyglot(
     repo = db.get(CodeRepo, repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
+    _reject_if_already_indexing(db, repo_id)
 
     known_languages = {lang.lower() for lang in LANGUAGE_EXTENSIONS.values()}
     requested = [l.lower() for l in body.languages or []]
@@ -691,6 +859,7 @@ def index_repo_polyglot_incremental(
     repo = db.get(CodeRepo, repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
+    _reject_if_already_indexing(db, repo_id)
 
     known_languages = {lang.lower() for lang in LANGUAGE_EXTENSIONS.values()}
     requested = [l.lower() for l in body.languages or []]

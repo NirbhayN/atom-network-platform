@@ -187,6 +187,28 @@ def fix_activity_syntax(source: str) -> str:
     return "\n".join(lines)
 
 
+def _prepare_plantuml_source(plantuml_source: str) -> str:
+    """Normalise LLM-written PlantUML before rendering.
+
+    Besides the smetana layout pragma, inject text-wrapping skinparams when the
+    source doesn't set its own: LLM sequence diagrams carry long side-notes and
+    message labels, and unwrapped they render 6:1-wide PNGs that collapse into
+    an illegible ~1-inch strip once fitted to the .docx page width. Wrapping at
+    250px yields a page-shaped diagram instead."""
+    source = fix_activity_syntax(plantuml_source)
+    # Inject layout pragma for better rendering
+    if "!pragma layout smetana" not in source:
+        source = source.replace("@startuml", "@startuml\n!pragma layout smetana", 1)
+    wrap_params = ""
+    if "skinparam wrapWidth" not in source:
+        wrap_params += "\nskinparam wrapWidth 250"
+    if "skinparam maxMessageSize" not in source:
+        wrap_params += "\nskinparam maxMessageSize 250"
+    if wrap_params:
+        source = source.replace("@startuml", "@startuml" + wrap_params, 1)
+    return source
+
+
 def generate_plantuml_diagram(plantuml_source: str, output_path: str) -> Optional[str]:
     """
     Render a PlantUML diagram to a PNG using the plantuml.jar CLI.
@@ -197,10 +219,7 @@ def generate_plantuml_diagram(plantuml_source: str, output_path: str) -> Optiona
         logger.debug("plantuml.jar not found — Pillow fallback will be used")
         return None
 
-    source = fix_activity_syntax(plantuml_source)
-    # Inject layout pragma for better rendering
-    if "!pragma layout smetana" not in source:
-        source = source.replace("@startuml", "@startuml\n!pragma layout smetana", 1)
+    source = _prepare_plantuml_source(plantuml_source)
 
     try:
         result = subprocess.run(

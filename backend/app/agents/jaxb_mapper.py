@@ -106,13 +106,20 @@ def extract_xjb_links(xjb_content: str, xjb_path: str) -> list[JaxbLink]:
     # would pull a nested binding's class up and double-count it. (The outer
     # schemaLocation-only binding has no `node` and is correctly skipped.)
     for b in root.iter():
+        # Comment / PI nodes have a callable `.tag` (lxml's etree.Comment),
+        # which QName() rejects with a ValueError — one XML comment in one .xjb
+        # used to abort the whole repo's artifact indexing. Same guard as
+        # module_context_generator._local.
+        if not isinstance(b.tag, str):
+            continue
         if etree.QName(b).localname != "bindings":
             continue
         node_xpath = b.get("node")
         if not node_xpath:
             continue
         cls = next((c.get("name") for c in b
-                    if etree.QName(c).localname == "class" and c.get("name")), None)
+                    if isinstance(c.tag, str)
+                    and etree.QName(c).localname == "class" and c.get("name")), None)
         links.append(JaxbLink(node_xpath, f"{xjb_path}{('::' + cls) if cls else ''}",
                               "xjb", _C_XJB, {"binding": "xjb", "class": cls}))
     return links

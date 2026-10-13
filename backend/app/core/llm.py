@@ -140,6 +140,21 @@ class UnsupportedProviderCapability(ValueError):
         )
 
 
+class LLMPermanentError(RuntimeError):
+    """A deterministic request rejection (upstream `invalid_request_error`)
+    surfaced through an exception type that normally means "transient".
+
+    The AiNxt gateway rewrites upstream 4xx into 502, which the SDK raises as
+    InternalServerError — nominally retryable. Retrying a malformed request is
+    futile: the same bytes get the same 400, and the agentic loop's
+    pause/auto-resume machinery then replays the futility for hours (see
+    wiki/tasks/llm-cache-marker-gateway-limit.md). This class name deliberately
+    contains none of the keywords `agentic_orchestrator._is_transient` matches
+    on ("connection", "timeout", "ratelimit", "internalserver", …), so a run
+    failing with it FAILS with the real error instead of pause-looping.
+    """
+
+
 #
 # Not every provider reaches every entry point. `call_llm`, `stream_llm` and
 # `call_llm_structured` work everywhere; the native tool loop and vision speak
@@ -386,13 +401,24 @@ def _ainxt_base_url() -> str:
     return base_url
 
 
+# Client identity for the AiNxt gateway's caller allowlist. Sent on BOTH
+# compat modes; without it the gateway rejects every call with 403
+# "Access denied: unrecognised client. Only approved ainxt clients are
+# permitted." This used to live only as an uncommitted patch in the prod
+# working tree and was erased by the 2026-10-07 redeploy clone — it is
+# hardcoded here so a fresh clone can never lose it again.
+_AINXT_CLIENT_HEADERS = {"x-ainxt-client-identifier": "ainxt-shell"}
+
+
 @lru_cache(maxsize=1)
 def _get_ainxt_client():
     """Cached AiNxt OpenAI-compat client (ainxt_compat_mode=openai)."""
     import openai
     base_url = _ainxt_base_url()
     api_key = settings.ainxt_api_key or "no-key"
-    return openai.AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=_sdk_client_timeout())
+    return openai.AsyncOpenAI(api_key=api_key, base_url=base_url,
+                              default_headers=_AINXT_CLIENT_HEADERS,
+                              timeout=_sdk_client_timeout())
 
 
 @lru_cache(maxsize=1)
@@ -407,7 +433,9 @@ def _get_ainxt_anthropic_client():
     import anthropic
     base_url = _ainxt_base_url()
     api_key = settings.ainxt_api_key or "no-key"
-    return anthropic.AsyncAnthropic(auth_token=api_key, base_url=base_url, timeout=_sdk_client_timeout())
+    return anthropic.AsyncAnthropic(auth_token=api_key, base_url=base_url,
+                                    default_headers=_AINXT_CLIENT_HEADERS,
+                                    timeout=_sdk_client_timeout())
 
 
 # ── Ollama (OpenAI-compatible) ────────────────────────────────────────────────
@@ -1255,6 +1283,36 @@ def _messages_with_cache_tail(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _strip_stale_cache_markers(messages: list[dict]) -> list[dict]:
+    """Remove `cache_control` markers embedded in INCOMING messages (copy-on-write).
+
+    This loop assigns the request's breakpoints itself (system + tools + tail);
+    a marker arriving ON a message can only come from a replayed or persisted
+    transcript — e.g. a resumed run whose stored turns were written by
+    `_messages_with_cache_tail` in an earlier call. Left in place, such markers
+    spend breakpoint budget that the budget math below never counts, and with
+    the gateway's auto-injected top-level marker that is an instant 400
+    ("A maximum of 4 blocks with cache_control may be provided"). Untouched
+    turns are returned as-is, so the common path allocates nothing.
+    """
+    out: list[dict] | None = None
+    for i, msg in enumerate(messages):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        cleaned: list | None = None
+        for j, block in enumerate(content):
+            if isinstance(block, dict) and "cache_control" in block:
+                if cleaned is None:
+                    cleaned = list(content)
+                cleaned[j] = {k: v for k, v in block.items() if k != "cache_control"}
+        if cleaned is not None:
+            if out is None:
+                out = list(messages)
+            out[i] = {**msg, "content": cleaned}
+    return out if out is not None else messages
+
+
 def _trim_system_cache_breakpoints(messages_api_system, keep: int):
     """Keep cache_control on at most the LAST ``keep`` system segments, dropping it from
     earlier ones. Anthropic caps a request at 4 cache breakpoints; a multi-segment system
@@ -1352,6 +1410,16 @@ async def _messages_api_create_with_retry(make_call, *, model, agent_name, corr_
         try:
             return await make_call()
         except transient_exc as e:  # type: ignore[misc]
+            # Deterministic 4xx dressed as transient: the AiNxt gateway rewrites
+            # upstream 400s into 502 (SDK: InternalServerError). Retrying replays
+            # the identical rejection, so fail fast with a type the orchestrator's
+            # transient classifier will NOT pause/auto-resume on.
+            if "invalid_request_error" in (str(e) or ""):
+                logger.error("PERMANENT_4XX | corr_id=%s provider=%s model=%s agent=%s err=%s",
+                             corr_id, provider, model, agent_name or "?", str(e)[:300])
+                raise LLMPermanentError(
+                    f"upstream invalid_request_error (deterministic — not retried): {str(e)[:500]}"
+                ) from e
             if attempt >= max_retries:
                 # `provider` is the CONFIGURED provider, not the wire protocol — the
                 # AiNxt gateway also reaches this loop over the Anthropic /v1/messages
@@ -1447,15 +1515,22 @@ async def call_messages_api_tools(
         raise UnsupportedProviderCapability("native tool loop", effective_provider)
     max_tokens = _clamp_max_tokens(max_tokens, chosen_model, effective_provider)
     messages_api_system = _system_for_messages_api(system)
+    # Replay/resume safety: markers persisted inside an earlier build's
+    # transcript must not spend this request's breakpoint budget.
+    messages = _strip_stale_cache_markers(messages)
     # Reserve cache-breakpoint budget (max 4) for the ROLLING MESSAGE TAIL — the largest,
     # growing, highest-value cache in a tool loop. A multi-segment system prompt + the tools
     # block can spend all 4 breakpoints, starving the tail so the whole transcript is re-billed
     # UNCACHED every turn (observed: cache-read ~18% and falling as the transcript grows). Keep
-    # ≤2 system breakpoints so system(≤2) + tools(1) + tail(1) ≤ 4; the static system still
-    # caches from its last retained breakpoint (accuracy-neutral).
+    # ≤1 system breakpoint so system(1) + tools(1) + tail(1) = 3 explicit: the AiNxt gateway
+    # unconditionally injects a top-level cache_control (automatic caching) that consumes the
+    # 4th slot — at keep=2 every call 400s with "A maximum of 4 blocks … Found 5" (see
+    # wiki/tasks/llm-cache-marker-gateway-limit.md; restore keep=2 once the gateway counts
+    # client markers before injecting). The static system still caches from its last retained
+    # breakpoint (accuracy-neutral).
     cache_on = settings.prompt_cache_enabled          # global kill-switch
     if cache_on and settings.agentic_cache_message_tail:
-        messages_api_system = _trim_system_cache_breakpoints(messages_api_system, keep=2)
+        messages_api_system = _trim_system_cache_breakpoints(messages_api_system, keep=1)
     # Anthropic allows at most 4 cache breakpoints per request (tools + system +
     # messages). If the caller's system already spends the full budget, skip the
     # tools breakpoint rather than 400 the whole request mid-loop.

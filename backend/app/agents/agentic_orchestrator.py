@@ -3405,6 +3405,33 @@ async def drive_run(db, run_id: str, *, owner: str = "orchestrator", model=None,
             S.mark_terminal(db, run, AgenticStatus.FAILED, error=_msg)
             db.commit()
             return {"acquired": True, "phase": run.phase, "status": run.status}
+        # Budget preflight: a run already at/over its token budget must not re-enter
+        # any phase. The in-loop guard only fires around LLM calls, so every futile
+        # (auto-)resume used to pay for one more call (~21k tokens — observed 10
+        # times on run a5f489f8, 4.01M → 4.13M, pure waste) before stopping again.
+        # One indexed SUM query here stops it at zero marginal cost. Deliberately
+        # NOT terminal: the run stays exactly as the in-loop soft-stop parked it,
+        # and resuming requires the operator to RAISE AGENTIC_TOKEN_BUDGET_HARD_CAP
+        # (this check then passes) — retrying without raising it does nothing.
+        _cap = int(getattr(settings, "agentic_token_budget_hard_cap", 0) or 0)
+        if _cap > 0 and getattr(settings, "agentic_token_budget_enforce", True):
+            from app.core.observability import get_cumulative_run_tokens
+            _spent = get_cumulative_run_tokens(run_id)
+            if _spent >= _cap:
+                logger.error("drive_run: run=%s OVER TOKEN BUDGET at entry (weighted %d >= cap %d) "
+                             "— not driving; raise AGENTIC_TOKEN_BUDGET_HARD_CAP to resume",
+                             run_id, _spent, _cap)
+                run = db.get(AgenticRun, run_id)
+                run.error_code = "token_budget_exceeded"
+                emit_event(db, run_id, "token_budget_exceeded",
+                           {"cumulative_run_tokens": _spent, "hard_cap": _cap,
+                            "at": "drive_entry",
+                            "action": f"⛔ Run is over its token budget ({_spent:,}/{_cap:,} "
+                                      "cost-weighted) — not resuming. Raise "
+                                      "AGENTIC_TOKEN_BUDGET_HARD_CAP and re-drive to continue."})
+                db.commit()
+                return {"acquired": True, "phase": run.phase, "status": run.status,
+                        "budget_exceeded": True}
         _max_phase_iters = 50
         for _phase_iter in range(_max_phase_iters):
             run = db.get(AgenticRun, run_id)

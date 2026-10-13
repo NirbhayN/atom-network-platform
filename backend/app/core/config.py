@@ -723,6 +723,15 @@ class Settings(BaseSettings):
     # iteration once cumulative spend for the run crosses `agentic_token_budget_hard_cap`
     # (soft-stop: the run is marked "budget_exceeded" so it can be resumed with a
     # raised budget rather than silently truncated mid-turn). 0 disables the guard.
+    #
+    # The cap is COST-WEIGHTED TOKENS, not a flat sum (2026-10): cache reads count
+    # at 10% and cache writes at 125% of input price, matching real billing — see
+    # observability.get_run_token_breakdown. A flat sum re-counted the same cached
+    # prefix at full weight on every call (~140× inflation on warm-cache runs;
+    # ledger of run a5f489f8: 4.2M flat vs ~1.27M weighted) and killed healthy runs
+    # the moment a gateway started reporting honest cache counters. Under weighted
+    # accounting 4M is a genuinely large run — recalibrate per deployment appetite,
+    # not back to the blind-meter era.
     agentic_token_budget_hard_cap: int = 4_000_000
     agentic_token_budget_warn_fraction: float = 0.8
     agentic_token_budget_enforce: bool = True
@@ -764,7 +773,14 @@ class Settings(BaseSettings):
     # if the summary call fails, deterministic eviction still runs.
     # NOTE: the summary is now ALWAYS captured before eviction — it is the safety net that keeps the
     # agent oriented, not a knob, so agentic_compact_summary was removed (2026-07-24).
-    agentic_compact_summary_max_tokens: int = 2000
+    # 2000→6000 (2026-10, via 4000): at 2000 and again at 4000 the summary consumed 100% of the
+    # budget on every compaction and was CUT OFF mid-write — a truncated summary loses part of the
+    # "goal / files / edits / what's left" state, the agent re-explores, context refills, and
+    # compaction thrashes (observed: run 60734b93 compacting every ~60s; run a5f489f8 burned its
+    # full token budget). If the full-budget warning still fires routinely at 6000, go to 8000 —
+    # but keep the retained floor (system + summary + kept turns) well under the compaction
+    # trigger or compaction thrashes (see the window-policy note above).
+    agentic_compact_summary_max_tokens: int = 6000
     # Turn-level recovery (grok-build-parity, 2026-07): a turn that stopped at max_tokens
     # (stop_reason='max_tokens' — output CUT mid-thought, possibly mid-tool_use) is DISCARDED
     # and retried once with a doubled output budget instead of letting the truncated turn

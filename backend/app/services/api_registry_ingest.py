@@ -695,6 +695,79 @@ def render_registry_sections(specs: list[dict]) -> list[dict]:
     return sections
 
 
+_PAIR_PREFIXES = (("Req", "Resp"), ("Resp", "Req"))
+
+
+def complete_message_pairs(names: list[str], available: dict | set) -> list[str]:
+    """Add the Req↔Resp counterpart of every name when the registry has one.
+
+    A flow is specified by BOTH halves of each exchange: a flow spec that names
+    ReqPay commits the TSD to RespPay's field dictionary too (the involved-XSD
+    bundle used to supply the Resp halves as a side effect of its schema scan;
+    this makes the guarantee explicit). Counterparts are looked up in
+    ``available`` — the registry's own message names — so a domain that doesn't
+    use the Req/Resp convention never matches and nothing is invented.
+    """
+    out = list(names)
+    for n in names:
+        for prefix, other in _PAIR_PREFIXES:
+            if n.startswith(prefix):
+                counterpart = other + n[len(prefix):]
+                if counterpart in available and counterpart not in out:
+                    out.append(counterpart)
+    return out
+
+
+def select_registry_api_scope(core: list[str], mentioned: list[str],
+                              available: dict | set) -> tuple[list[str], list[str]]:
+    """Split registry APIs into (full-spec names, referenced-only names).
+
+    Full field dictionaries render ONLY for the feature's core APIs — the set
+    derived from ratified inputs (approved XSD + flow spec). A registry API the
+    document merely mentions (an Interfaces-in-Scope inventory row, a prose
+    aside) is cross-referenced instead of expanded, so the TSD details the APIs
+    this change actually touches rather than every API the prose names.
+
+    With NO core names (nothing ratified yet — no approved XSD, no flow spec),
+    mentions are the only signal and all of them render in full: a document
+    with real tables beats one with none.
+    """
+    core_in = [n for n in core if n in available]
+    if not core_in:
+        return [n for n in mentioned if n in available], []
+    referenced = sorted(n for n in mentioned if n in available and n not in core_in)
+    return core_in, referenced
+
+
+# The deterministic eval check (check_tsd_api_specs_registry_backed) matches this
+# exact "<name>: reused unchanged" phrase as the accepted alternative to a full
+# "API Specification — <name>" section. Change one, change both.
+REFERENCED_API_MARKER = "reused unchanged"
+
+
+def render_registry_reference_section(names: list[str]) -> dict | None:
+    """One compact section cross-referencing reused registry APIs — no tables."""
+    if not names:
+        return None
+    return {
+        "section_key": "api_registry_referenced",
+        "section_heading": "Referenced Wire APIs (reused — unchanged)",
+        "render_style": "body",
+        "level": 2,
+        "paragraphs": [
+            "The wire APIs below are touched by this flow only as-is: this "
+            "feature changes none of their fields. Their authoritative field "
+            "dictionaries live in the platform API Registry and are deliberately "
+            "not repeated here.",
+            *[f"{n}: {REFERENCED_API_MARKER} — see the API Registry for the full "
+              "field dictionary." for n in names],
+        ],
+        "bullet_points": [],
+        "numbered_items": [],
+        "code_blocks": [],
+    }
+
+
 def content_hash(specs: list[dict]) -> str:
     import json
     return hashlib.sha256(json.dumps(specs, sort_keys=True).encode()).hexdigest()[:16]

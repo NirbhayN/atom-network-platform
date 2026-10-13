@@ -89,8 +89,10 @@ Re-derive the figures below when the source changes, and update the stamp:
 | `GET` | `/api/api-registry/messages` | List Messages |
 | `GET` | `/api/api-registry/messages/{message_id}` | Get Message |
 | `PATCH` | `/api/api-registry/messages/{message_id}` | Patch Message |
+| `POST` | `/api/api-registry/messages/{message_id}/generate` | Generate Message Payload |
 | `GET` | `/api/api-registry/production-source` | Get Production Source |
 | `PUT` | `/api/api-registry/production-source` | Set Production Source |
+| `POST` | `/api/api-registry/validate` | Validate Registry Payload |
 
 ## app-config
 

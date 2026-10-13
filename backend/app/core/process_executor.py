@@ -293,12 +293,23 @@ def run_sync(req: ProcessExecutionRequest) -> ProcessResult:
     the SAME allowlist/timeout/audit-logging logic as the async path; this
     is a convenience shim, not a second implementation.
 
-    Uses `asyncio.run()`, which requires no event loop already running on
-    the calling thread — correct for these call sites (plain functions
-    called from synchronous contexts), but NOT safe to call from inside an
-    already-running event loop (use `await default_executor.run(...)`
-    directly there instead)."""
-    return asyncio.run(default_executor.run(req))
+    Loop-safe: `asyncio.run()` refuses to start inside an already-running
+    event loop, and some of these sync helpers ARE reached from async code
+    (observed: jdk_discovery via an async caller — the prepared coroutine was
+    discarded with a "never awaited" RuntimeWarning and the blanket
+    `except Exception` at the call site hid the real error, silently dropping
+    the alternatives lookup). When a loop is running on the calling thread,
+    execute the coroutine on a private thread with its own loop and block for
+    the result — same blocking semantics the sync caller already expects.
+    Prefer `await default_executor.run(...)` in genuinely async code; this
+    fallback keeps shared sync/async helper paths correct either way."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(default_executor.run(req))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, default_executor.run(req)).result()
 
 
 # Module-level default instance — call sites migrating from a direct
