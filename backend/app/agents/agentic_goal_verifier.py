@@ -192,7 +192,11 @@ async def run_goal_verifier(db, *, run_id: str, ctx, change_set, intent: str = "
     """Run the skeptic panel and aggregate. Skeptic 0 runs FIRST alone; a high-confidence
     decisive refute from it short-circuits the remaining spawns (cost control — grok's
     gatekeeper). Panel size from ``settings.agentic_verifier_panel_size`` (default 3)."""
-    model = reviewer_model or settings.agentic_reviewer_model or get_model("review")
+    # get_model() takes a PROVIDER, not a purpose — get_model("review") raised
+    # "Unknown LLM provider: 'review'" whenever agentic_reviewer_model was unset
+    # (its default), crashing the whole verification panel. Blank setting = the
+    # active provider's own model, mirroring agentic_review.py.
+    model = reviewer_model or settings.agentic_reviewer_model or get_model()
     panel = max(1, int(getattr(settings, "agentic_verifier_panel_size", 3) or 3))
     diff_text = _render_diff(workspace_run_id or run_id, change_set)
     user = build_evidence_user_prompt(

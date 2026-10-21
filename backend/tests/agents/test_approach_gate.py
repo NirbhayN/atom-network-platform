@@ -175,9 +175,9 @@ def test_step_proposes_and_gates_when_no_decision(monkeypatch):
     _patch_common(monkeypatch, events)
     monkeypatch.setattr(settings, "agentic_approach_gate", True)
     async def fake_propose(db, run, art, model):
-        return {"summary": "txn goes through the existing pay flow",
-                "options": [{"id": "reuse", "approach": "reuse", "target_api": "txn API"}],
-                "recommended": "reuse"}
+        return ({"summary": "txn goes through the existing pay flow",
+                 "options": [{"id": "reuse", "approach": "reuse", "target_api": "txn API"}],
+                 "recommended": "reuse"}, "completed")
     monkeypatch.setattr(O, "_phase_propose", fake_propose)
     # _phase_xsd must NOT be called in the propose pass.
     monkeypatch.setattr(O, "_phase_xsd", lambda *a, **k: (_ for _ in ()).throw(AssertionError("edited before decision!")))

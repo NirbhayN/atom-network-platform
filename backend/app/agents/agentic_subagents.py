@@ -1327,7 +1327,8 @@ async def run_approach_proposal(db, *, run_id: str, ctx: ContextPack, intent: st
                                 model: str | None = None, cancel_check=None, heartbeat=None,
                                 workspace_run_id: str | None = None,
                                 plan_block: str = "", scope: str = "full",
-                                resume_transcript: list[dict] | None = None) -> dict | None:
+                                resume_transcript: list[dict] | None = None,
+                                ) -> tuple[dict | None, str]:
     """Reuse-first decision pass: map existing flows + propose OPTIONS for a human.
     ``scope='xsd'`` (Phase A) restricts the question to SCHEMA choices in plain language —
     no architecture options, no new services. Read-only (PROPOSE_TOOLS) — no edits.
@@ -1335,7 +1336,9 @@ async def run_approach_proposal(db, *, run_id: str, ctx: ContextPack, intent: st
     each option is flagged for divergence from it so the human sees what differs and why.
     ``resume_transcript`` is the ratified analysis run's conversation: when set (and enabled),
     propose CONTINUES it — the discovery sweep analysis already did (same 14 read tools) stays
-    in context instead of being redone from turn 1. Returns the proposal dict, or None."""
+    in context instead of being redone from turn 1. Returns ``(proposal, stopped)`` — the
+    proposal dict or None, plus the loop's stop reason so a no-options outcome reports WHY
+    (budget_exceeded / max_iterations), not just that it happened."""
     # The plan is per-run (not cacheable), so it rides the user prompt, not the cached preface.
     plan_seg = (("\n\nRATIFIED PLAN (the analysis recommended this direction — for EACH option set "
                  "diverges_from_plan + divergence_note relative to it):\n" + plan_block)
@@ -1384,7 +1387,7 @@ async def run_approach_proposal(db, *, run_id: str, ctx: ContextPack, intent: st
     if res is None:
         user = f"Requirement:\n{wrap_untrusted(intent, 'REQUIREMENT')}\n\n{ask}{plan_seg}"
         res = await run_agent_loop(user_prompt=user, **common)
-    return res.proposal
+    return res.proposal, res.stopped
 
 
 async def run_xsd_discovery(db, *, run_id: str, ctx: ContextPack, intent: str = "",

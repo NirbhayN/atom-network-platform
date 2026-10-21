@@ -431,10 +431,12 @@ def _heartbeat(db, run: AgenticRun, art: dict):
     return _beat
 
 
-async def _phase_propose(db, run: AgenticRun, art: dict, model) -> dict | None:
+async def _phase_propose(db, run: AgenticRun, art: dict, model) -> tuple[dict | None, str]:
     """Reuse-first decision pass: the agent maps the existing flows and proposes
     OPTIONS (no edits). Phase A (kind='xsd') asks ONLY the schema question, in plain
-    language; a full run asks the broader reuse-vs-new question."""
+    language; a full run asks the broader reuse-vs-new question.
+    Returns ``(proposal, stopped)`` — the stop reason lets the gate report WHY the
+    agent returned no options (budget_exceeded / max_iterations / cancelled)."""
     # Give the approach agent the ratified plan so it can flag, per option, whether the
     # option diverges from what the plan recommended (drives the gate's divergence badge).
     plan_block = _analysis_plan_block(db, run.change_request_id)
@@ -456,13 +458,13 @@ async def _phase_propose(db, run: AgenticRun, art: dict, model) -> dict | None:
                 resume = (arun.handoff_json or {}).get("analysis_transcript")
         except Exception as e:  # noqa: BLE001 — replay is an optimization, never a blocker
             logger.debug("propose: analysis-transcript lookup failed (%s) — fresh exploration", e)
-    proposal = await agentic_subagents.run_approach_proposal(
+    proposal, stopped = await agentic_subagents.run_approach_proposal(
         db, run_id=run.id, ctx=art["ctx"], intent=art.get("intent", ""), model=model,
         scope="xsd" if (run.kind or "full") == "xsd" else "full", plan_block=plan_block,
         resume_transcript=resume,
         cancel_check=lambda: S.check_cancel(db.get(AgenticRun, run.id)) or _lease_lost_set(art),
         heartbeat=_heartbeat(db, run, art), workspace_run_id=_ws_id(run))
-    return proposal
+    return proposal, stopped
 
 
 async def _phase_analysis(db, run: AgenticRun, art: dict, model) -> tuple[dict | None, str]:
@@ -3791,7 +3793,7 @@ async def _step(db, run: AgenticRun, art: dict, model) -> None:
         gate_on = settings.agentic_approach_gate and (run.kind or "full") in ("xsd", "full")
         if gate_on and not handoff.get("approach_decision") and not handoff.get("xsd_change_request"):
             # Reuse-first decision pass: map flows + propose options; STOP for the human.
-            proposal = await _phase_propose(db, run, art, model)
+            proposal, prop_stopped = await _phase_propose(db, run, art, model)
             if proposal and proposal.get("options"):
                 emit_event(db, run.id, "approach_proposal",
                            {**proposal, "action":
@@ -3801,12 +3803,23 @@ async def _step(db, run: AgenticRun, art: dict, model) -> None:
                 # Gate is ON but the agent returned NO options. Do NOT silently proceed —
                 # that would turn an LLM miss into permission to create. Fail recoverably
                 # so a human can re-run; the reuse-first gate must never be skipped.
+                # Name the ACTUAL stop cause (budget/iteration cap/cancel) — the bare
+                # "did not return options" read as a model problem when the loop was
+                # being stopped by the harness (same masking the analysis phase had).
+                _pwhy = {
+                    "budget_exceeded": "run token budget exhausted before options — raise "
+                                       "AGENTIC_TOKEN_BUDGET_HARD_CAP (cumulative across resumes)",
+                    "max_iterations": "iteration cap hit before the agent called propose_approach",
+                    "cancelled": "run was cancelled mid-proposal",
+                }.get(prop_stopped, "the agent stopped without calling propose_approach")
                 run.error_code = "approach_gate_no_options"
                 emit_event(db, run.id, "approach_gate_failed",
-                           {"action": "⚠ The agent did not return reuse-vs-new options — not proceeding. "
-                                      "Re-run so the approach gate can present choices."})
+                           {"stopped": prop_stopped,
+                            "action": f"⚠ The agent did not return reuse-vs-new options ({_pwhy}) — "
+                                      "not proceeding. Re-run so the approach gate can present choices."})
                 S.mark_terminal(db, run, AgenticStatus.FAILED,
-                                error="reuse-first approach gate produced no options; refusing to auto-generate")
+                                error=f"reuse-first approach gate produced no options ({prop_stopped}): "
+                                      f"{_pwhy}; refusing to auto-generate")
         else:
             await _phase_xsd(db, run, art, model); _post_xsd_advance(db, run, art)
     elif phase == P.CODE_CHANGE.value:
