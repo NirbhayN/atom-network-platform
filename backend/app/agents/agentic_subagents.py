@@ -1247,13 +1247,15 @@ async def run_analysis(db, *, run_id: str, ctx: ContextPack, intent: str = "",
                        workspace_run_id: str | None = None,
                        resume_transcript: list[dict] | None = None,
                        facts: list | None = None,
-                       ) -> tuple[dict | None, list[dict], list[dict]]:
+                       ) -> tuple[dict | None, list[dict], list[dict], str]:
     """Read-only Change-Analysis pass (S2). Reads code, then either asks the PM
     (ask_clarifications) or proposes the dual-view plan (propose_plan). Returns
-    ``(proposal, transcript, facts)`` — the proposal dict (``kind`` in
+    ``(proposal, transcript, facts, stopped)`` — the proposal dict (``kind`` in
     {"clarifications","plan"}) or None, the full conversation so the orchestrator can
-    persist it for replay on the next drive, and the fact sheet (record_fact + platform
-    auto-facts) for cross-phase handoff. No edits.
+    persist it for replay on the next drive, the fact sheet (record_fact + platform
+    auto-facts) for cross-phase handoff, and the loop's stop reason so a no-proposal
+    outcome reports WHY (budget_exceeded / max_iterations), not just that it happened.
+    No edits.
 
     On a re-drive (answers / plan revision) with ``resume_transcript`` set and replay enabled,
     the first drive's conversation is CONTINUED (the answers arrive as the gate tool's result)
@@ -1318,7 +1320,7 @@ async def run_analysis(db, *, run_id: str, ctx: ContextPack, intent: str = "",
             res = await _fresh_exploration()
     else:                                             # FRESH exploration (first drive / fallback)
         res = await _fresh_exploration()
-    return res.proposal, res.transcript, res.facts
+    return res.proposal, res.transcript, res.facts, res.stopped
 
 
 async def run_approach_proposal(db, *, run_id: str, ctx: ContextPack, intent: str = "",

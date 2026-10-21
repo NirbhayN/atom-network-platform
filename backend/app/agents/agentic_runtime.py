@@ -233,6 +233,13 @@ def _policy_window(model: str | None) -> int:
     fires only after the real window has already overflowed."""
     try:
         from app.core.tokens import model_context_window
+        if not model:
+            # The orchestrator threads model=None and lets the call layer resolve it.
+            # Budgeting from None skips the per-model table and lands on the PROVIDER
+            # fallback (ainxt: 128K) — which silently clamped a 600K policy to 128K and
+            # compacted every run into thrash. Resolve the same id the call layer will use.
+            from app.core.llm import get_model
+            model = get_model()
         return min(int(settings.agentic_context_window_tokens), int(model_context_window(model)))
     except Exception:  # noqa: BLE001 — policy fallback, never breaks the loop
         return int(settings.agentic_context_window_tokens)
@@ -772,7 +779,18 @@ async def run_agent_loop(
         _base_chars = len(str(system)) + len(str(tools))
     except Exception:  # noqa: BLE001 — estimate only; a stringify failure must not end the run
         _base_chars = 0
-    _pol_window = _policy_window(model)   # config policy clamped to the REAL model window
+    # Resolve the model id ONCE for budgeting. `model` is usually None here (the call layer
+    # resolves it per-request), but window/output budgets computed from None fall to provider
+    # fallbacks instead of the real model's limits — the bug that ran every loop at 128K.
+    try:
+        from app.core.llm import get_model as _get_model
+        _budget_model = model or _get_model()
+    except Exception:  # noqa: BLE001 — budgeting falls back to provider defaults, never fatal
+        _budget_model = model
+    _pol_window = _policy_window(_budget_model)   # config policy clamped to the REAL model window
+    logger.info("agent_loop[%s] run=%s context budget: window=%d (model=%s, configured policy=%d)",
+                agent_name, run_id, _pol_window, _budget_model or "(default)",
+                settings.agentic_context_window_tokens)
     i = 0
     loop_t0 = time.monotonic()
     while i < cap:
@@ -953,7 +971,7 @@ async def run_agent_loop(
         # (AiNxt-openai strips stop_reason → the truncation branch simply never fires there.)
         if settings.agentic_turn_recovery:
             from app.core.tokens import model_max_output_tokens
-            _retry_tokens = min(out_tokens * 2, model_max_output_tokens(model))
+            _retry_tokens = min(out_tokens * 2, model_max_output_tokens(_budget_model))
             if turn.stop_reason == "max_tokens" and _retry_tokens > out_tokens:
                 logger.warning("agent_loop[%s] run=%s turn TRUNCATED at max_tokens=%d — discarding "
                                "and retrying once at %d", agent_name, run_id, out_tokens, _retry_tokens)

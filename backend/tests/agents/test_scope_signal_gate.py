@@ -47,7 +47,7 @@ def _drive(db, run):
 def test_plan_first_run_pivots_to_scope_signals(monkeypatch):
     events, advances = _patch(monkeypatch, captured=False)
     async def fake_analysis(db, run, art, model):
-        return {"summary": "add complaint", "functional_plan": {"summary": "add complaint"}}
+        return {"summary": "add complaint", "functional_plan": {"summary": "add complaint"}}, "completed"
     monkeypatch.setattr(O, "_phase_analysis", fake_analysis)
     run = _run()
     _drive(None, run)
@@ -61,7 +61,7 @@ def test_plan_first_run_pivots_to_scope_signals(monkeypatch):
 def test_plan_first_run_with_signals_captured_goes_straight_to_plan(monkeypatch):
     events, advances = _patch(monkeypatch, captured=True)          # a clarifications round already got them
     async def fake_analysis(db, run, art, model):
-        return {"summary": "s", "functional_plan": {"summary": "s"}}
+        return {"summary": "s", "functional_plan": {"summary": "s"}}, "completed"
     monkeypatch.setattr(O, "_phase_analysis", fake_analysis)
     run = _run()
     _drive(None, run)
@@ -73,7 +73,7 @@ def test_plan_first_run_with_signals_captured_goes_straight_to_plan(monkeypatch)
 def test_capture_disabled_does_not_pivot(monkeypatch):
     events, advances = _patch(monkeypatch, captured=False, capture_on=False)
     async def fake_analysis(db, run, art, model):
-        return {"summary": "s", "functional_plan": {"summary": "s"}}
+        return {"summary": "s", "functional_plan": {"summary": "s"}}, "completed"
     monkeypatch.setattr(O, "_phase_analysis", fake_analysis)
     run = _run()
     _drive(None, run)

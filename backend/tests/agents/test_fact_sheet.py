@@ -232,7 +232,7 @@ def test_run_analysis_seeds_handoff_facts(monkeypatch):
     from app.agents import agentic_subagents as S
     from app.agents.context_assembler import ContextPack
     _script(monkeypatch, [_turn([], text="no questions", stop="end_turn")])
-    proposal, transcript, facts = asyncio.run(S.run_analysis(
+    proposal, transcript, facts, stopped = asyncio.run(S.run_analysis(
         None, run_id="r", ctx=ContextPack(selected_repo_ids=["x"]), intent="i",
         facts=[{"id": "F1", "fact": "seeded from drive 1", "source": "human_decision",
                 "kind": "human_decision"}]))

@@ -465,10 +465,12 @@ async def _phase_propose(db, run: AgenticRun, art: dict, model) -> dict | None:
     return proposal
 
 
-async def _phase_analysis(db, run: AgenticRun, art: dict, model) -> dict | None:
+async def _phase_analysis(db, run: AgenticRun, art: dict, model) -> tuple[dict | None, str]:
     """Change-Analysis pass (S2, kind='analysis'): read the code and either ask the
     PM (ask_clarifications) or propose the dual-view plan (propose_plan). Read-only.
-    Re-entry inputs (PM answers / re-validation feedback) come from handoff_json."""
+    Re-entry inputs (PM answers / re-validation feedback) come from handoff_json.
+    Returns ``(proposal, stopped)`` — the loop's stop reason lets the caller report
+    WHY a no-proposal drive ended (budget_exceeded / max_iterations / cancelled)."""
     handoff = run.handoff_json or {}
     # Name this pass's transcript folder after WHY we are (re-)entering analysis: a fresh
     # run, PM answers to ask_clarifications, or a reopened plan. See app.core.transcripts.
@@ -479,7 +481,7 @@ async def _phase_analysis(db, run: AgenticRun, art: dict, model) -> dict | None:
                         else "initial")
     except Exception:  # noqa: BLE001 — labelling must never break the phase
         pass
-    proposal, transcript, facts = await agentic_subagents.run_analysis(
+    proposal, transcript, facts, stopped = await agentic_subagents.run_analysis(
         db, run_id=run.id, ctx=art["ctx"], intent=art.get("intent", ""), model=model,
         clarification_answers=handoff.get("clarification_answers"),
         plan_feedback=handoff.get("plan_feedback"),
@@ -500,7 +502,7 @@ async def _phase_analysis(db, run: AgenticRun, art: dict, model) -> dict | None:
         h = dict(run.handoff_json or {})
         h["facts"] = _merge_facts(h.get("facts"), facts)
         run.handoff_json = h
-    return proposal
+    return proposal, stopped
 
 
 def _merge_facts(old: list | None, new: list | None) -> list:
@@ -3637,13 +3639,27 @@ async def _step(db, run: AgenticRun, art: dict, model) -> None:
                                   "tech-lead the technical analysis"})
             S.advance(db, run, P.AWAITING_PLAN_APPROVAL)
             return
-        proposal = await _phase_analysis(db, run, art, model)
+        proposal, stopped = await _phase_analysis(db, run, art, model)
         if not proposal:
+            # Name the ACTUAL stop cause. The generic "neither clarifications nor a plan"
+            # masked budget exhaustion: every manual resume re-hit the (cumulative) budget
+            # at iteration 1, failed with the same message, and read as a model problem —
+            # observed as 10 straight resume→insta-fail cycles on one run.
+            _why = {
+                "budget_exceeded": "run token budget exhausted before a proposal — raise "
+                                   "AGENTIC_TOKEN_BUDGET_HARD_CAP (the budget is cumulative "
+                                   "across resumes) or disable AGENTIC_TOKEN_BUDGET_ENFORCE",
+                "max_iterations": f"iteration cap ({settings.agentic_analysis_max_iterations}) "
+                                  "hit without a proposal — the agent could not converge; "
+                                  "re-run or raise AGENTIC_ANALYSIS_MAX_ITERATIONS",
+                "cancelled": "run was cancelled mid-analysis",
+            }.get(stopped, "the agent stopped without calling ask_clarifications or propose_plan")
             run.error_code = "analysis_no_proposal"
             emit_event(db, run.id, "analysis_no_proposal",
-                       {"action": "⚠ Analysis produced neither clarifications nor a plan — re-run."})
+                       {"stopped": stopped,
+                        "action": f"⚠ Analysis produced neither clarifications nor a plan: {_why}"})
             S.mark_terminal(db, run, AgenticStatus.FAILED,
-                            error="change analysis produced neither clarifications nor a plan")
+                            error=f"change analysis produced no proposal ({stopped}): {_why}")
         elif proposal.get("kind") == "clarifications":
             # v1 — append the PM scope-signal questions so they're captured through
             # the live agentic clarification stage (AnalysisPanel → decision ledger),
