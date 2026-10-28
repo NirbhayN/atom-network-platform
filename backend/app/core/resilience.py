@@ -137,13 +137,49 @@ def circuit_state(provider: str) -> CircuitState:
     return _get_state(provider).state
 
 
-def reset_circuit(provider: str) -> None:
-    """Operator/admin escape hatch (e.g. a `/admin/llm/circuit/{provider}/reset`
-    endpoint) — forces a provider back to CLOSED after a manual fix. Emits a
-    security-relevant telemetry line since this is a control-plane action —
-    an emergency control."""
+def circuit_snapshot() -> dict[str, dict]:
+    """Every provider the process has OBSERVED, with its breaker state — backs the
+    admin diagnostics view. Only providers that have been called appear: `_STATE` is
+    populated lazily, and listing never-used providers as "closed" would imply a
+    health check that never ran.
+
+    `opened_for_s` / `cooldown_remaining_s` are present only while OPEN, so an
+    operator can see whether the breaker is about to self-heal into HALF_OPEN
+    (and therefore whether a manual reset is even needed).
+    """
+    cooldown = float(getattr(settings, "llm_circuit_breaker_cooldown_s", 30.0))
+    now = time.monotonic()
+    out: dict[str, dict] = {}
     with _STATE_LOCK:
-        st = _get_state(provider)
+        items = list(_STATE.items())
+    for provider, st in items:
+        row: dict = {
+            "state": st.state.value,
+            "consecutive_failures": st.consecutive_failures,
+        }
+        if st.state == CircuitState.OPEN:
+            opened_for = now - st.opened_at
+            row["opened_for_s"] = round(opened_for, 1)
+            row["cooldown_remaining_s"] = round(max(0.0, cooldown - opened_for), 1)
+        out[provider] = row
+    return out
+
+
+def reset_circuit(provider: str) -> None:
+    """Operator/admin escape hatch (the `/admin/llm/circuit/{provider}/reset`
+    endpoint in `app/api/admin_llm_circuit.py`) — forces a provider back to CLOSED
+    after a manual fix. Emits a security-relevant telemetry line since this is a
+    control-plane action — an emergency control.
+
+    `_get_state` is resolved BEFORE taking the lock, not inside it: `_STATE_LOCK` is a
+    plain `threading.Lock` (not an RLock), and `_get_state` acquires it itself, so the
+    original `with _STATE_LOCK: st = _get_state(...)` self-deadlocked on the first call
+    — hanging the caller forever while holding the lock that every other LLM call needs.
+    It went unnoticed because nothing invoked this function. Every other mutator here
+    (`_before_call`, `_on_success`, `_on_failure`) already uses this fetch-then-lock order.
+    """
+    st = _get_state(provider)
+    with _STATE_LOCK:
         st.state = CircuitState.CLOSED
         st.consecutive_failures = 0
         st.half_open_successes = 0
@@ -189,8 +225,76 @@ def _on_success(provider: str) -> None:
             st.consecutive_failures = 0
 
 
+# ── What counts as evidence that a PROVIDER is unhealthy ─────────────────────
+# A breaker exists to stop hammering a dependency that is down. It must therefore
+# only react to signals about the dependency's HEALTH. A 400 ("invalid request")
+# or 404 ("model not available") is the provider answering correctly and promptly
+# about a bad request WE sent — it says nothing about its health, and retrying a
+# different request would have succeeded.
+#
+# The 2026-10-22 ainxt outage is the worked example: Claude models were disabled
+# on the gateway, two aux agents (taxonomy, query_understanding) were still
+# configured with `claude-haiku-4-5-20251001`, and their steady 400s drove
+# consecutive_failures past the threshold. The breaker opened for the WHOLE
+# `ainxt` provider, which also fronts the GPT models — so one misconfigured aux
+# model black-holed every healthy model behind the same gateway. Classifying
+# before recording confines the blast radius to the misconfigured call.
+#
+# Timeouts, connection errors, 429s and 5xxs still count: those ARE health.
+_HEALTH_SIGNAL_STATUSES = frozenset({408, 425, 429})
+
+
+def _http_status_of(exc: BaseException) -> int | None:
+    """HTTP status carried by an SDK/transport exception, or None if it isn't an
+    HTTP-status failure at all (connection reset, DNS, timeout, ...).
+
+    Covers the three shapes the call layer produces: the OpenAI and Anthropic SDKs'
+    `APIStatusError.status_code`, and httpx's `HTTPStatusError.response.status_code`
+    (the Gemini path). Duck-typed on purpose — importing the SDKs here would couple
+    this module to whichever client happens to be installed, and the attribute names
+    are stable public API on all three.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def counts_toward_breaker(exc: BaseException) -> bool:
+    """True if `exc` is evidence the PROVIDER is unhealthy (so the breaker should
+    count it). False for client-side 4xx — those fail the call but must not trip
+    the circuit. Public so the admin/diagnostics surface and tests can reuse it."""
+    # A cancelled task is OUR decision (run cancelled, shutdown, timeout race), not
+    # the provider misbehaving. `guarded_call` catches BaseException, so without this
+    # cancelling a long run would ding the breaker on the way out.
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    status = _http_status_of(exc)
+    if status is None:
+        # No HTTP status => transport-level failure (connect/read timeout, reset
+        # connection, DNS). Exactly what the breaker is for.
+        return True
+    if status in _HEALTH_SIGNAL_STATUSES or status >= 500:
+        return True
+    # Any other 4xx: our request was wrong (400 bad request, 401/403 misconfigured
+    # credential, 404 unknown model, 422 unprocessable). Fail the call, spare the circuit.
+    return not (400 <= status < 500)
+
+
 def _on_failure(provider: str, exc: BaseException) -> None:
     if not getattr(settings, "llm_circuit_breaker_enabled", True):
+        return
+    if not counts_toward_breaker(exc):
+        # Logged at debug: these are frequent during a misconfiguration and the call
+        # itself is already logged as a hard error by the llm.py call layer.
+        logger.debug(
+            "LLM_CIRCUIT_IGNORED_FAILURE | provider=%s | http_status=%s | "
+            "client-side error, not counted toward the breaker | error=%s",
+            provider, _http_status_of(exc), exc,
+        )
         return
     st = _get_state(provider)
     threshold = int(getattr(settings, "llm_circuit_breaker_failure_threshold", 5))
@@ -291,8 +395,11 @@ async def guarded_call(provider: str):
     limit is saturated, or `LlmCircuitOpenError` immediately if the
     provider's breaker is OPEN — in both cases WITHOUT making a network
     call, so a degraded/overloaded provider cannot be piled onto further.
-    On successful completion of the `with` body, records a breaker success;
-    on any exception, records a breaker failure and re-raises unchanged.
+    On successful completion of the `with` body, records a breaker success; on an
+    exception the breaker records a failure ONLY when the exception is evidence the
+    provider is unhealthy (see `counts_toward_breaker` — client-side 4xx are not).
+    Either way the exception is re-raised unchanged, so the caller's error handling
+    is identical; the classification affects breaker bookkeeping only.
     """
     sem = _get_semaphore(provider)
     if sem is not None and sem.locked():
