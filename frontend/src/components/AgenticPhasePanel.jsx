@@ -545,10 +545,13 @@ function ModuleReport({ modules, footer }) {
   const groups = { failed: [], built: [], skipped: [] }
   for (const [name, m] of entries) (groups[m?.status] || groups.skipped).push([name, m])
   const counts = `${groups.built.length} built · ${groups.failed.length} failed · ${groups.skipped.length} skipped`
-  // Collapsed by default (even on failure) so the build outcome isn't highlighted; the
-  // verification-decision gate (footer), when present, lives inside this same collapsible.
+  // Collapsed by default (even on failure) so the build outcome isn't highlighted — but
+  // OPEN whenever the verification-decision gate (footer) is present. That gate lives
+  // inside this same collapsible, so leaving it shut hid the only two controls that can
+  // un-park a run at awaiting_verify_decision: the run announced "your call — retry or
+  // skip" and then offered nothing to click.
   return (
-    <details style={{ marginBottom: 8, padding: '8px 12px', borderRadius: 8,
+    <details open={!!footer} style={{ marginBottom: 8, padding: '8px 12px', borderRadius: 8,
       border: '1px solid var(--border)', background: 'rgba(100,116,139,0.06)' }}>
       <summary style={{ cursor: 'pointer', fontSize: 13, fontWeight: 600, color: 'var(--text-secondary)' }}>
         🧩 Module build report — {counts}

@@ -65,3 +65,54 @@ def test_plugin_resolution_failure_is_environment():
     r = parse_maven_output(out)
     assert r.is_environment_failure and r.error_count == 0
     assert r.environment_errors
+
+
+# ── Legacy "1.x" Java version scheme ──────────────────────────────────────────
+# A module still pinned to `<maven.compiler.release>1.8</maven.compiler.release>`
+# makes javac abort with "release version 1.8 not supported". The demanded major is
+# 8 — capturing the "1" told the user to "install JDK 1", which does not exist.
+_LEGACY_RELEASE = (
+    "[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.14.1:"
+    "compile (default-compile) on project iupi-gateway-common: Fatal error compiling: "
+    "error: release version 1.8 not supported -> [Help 1]")
+
+
+def _skip_pats(spec):
+    """Compile a skip spec the way verification_plan._skip_patterns() does."""
+    import re
+    star = re.escape("*")
+    return [re.compile(re.escape(s.strip()).replace(star, ".*"), re.IGNORECASE)
+            for s in spec.split(",") if s.strip()]
+
+
+def test_legacy_1_x_release_reports_the_real_major():
+    r = parse_maven_output(_LEGACY_RELEASE)
+    assert r.required_java == 8, "'1.8' must normalise to 8, not 1"
+    assert r.is_environment_failure and r.error_count == 0
+
+
+def test_legacy_1_x_source_option_reports_the_real_major():
+    r = parse_maven_output("[ERROR] Source option 1.6 is no longer supported. Use 1.8 or later.")
+    assert r.required_java == 6
+
+
+def test_modern_release_form_still_parses():
+    r = parse_maven_output("[ERROR] invalid target release: 25")
+    assert r.required_java == 25
+
+
+def test_skip_modules_excludes_a_jdk_failure_in_an_out_of_scope_module():
+    # AGENTIC_VERIFY_SKIP_MODULES must cover toolchain failures too: one legacy module
+    # pinned to an old Java release otherwise condemns the whole reactor, because javac
+    # dies before emitting any file:line diagnostic (error_count == 0 → environment
+    # failure). Maven names the project on the failing line, so attribution works even
+    # though the reactor aborted before `current_module` was set.
+    r = parse_maven_output(_LEGACY_RELEASE, skip_patterns=_skip_pats("*iupi*"))
+    assert not r.is_environment_failure
+    assert r.environment_errors == []
+    assert r.soft_count == 1
+
+
+def test_skip_modules_does_not_mask_an_unrelated_module():
+    r = parse_maven_output(_LEGACY_RELEASE, skip_patterns=_skip_pats("*hsm-proxy*"))
+    assert r.is_environment_failure and r.required_java == 8

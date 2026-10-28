@@ -80,10 +80,16 @@ _BUILD_RESULT = re.compile(r"^\[INFO\]\s+BUILD\s+(?P<result>SUCCESS|FAILURE)")
 # carry the demanded major so the runtime can say "needs Java N but active JDK is M".
 #   "invalid target release: 25" / "invalid source release: 25"
 #   "error: release version 25 not supported"
+# The optional `1.` consumes the LEGACY version scheme ("1.8" → 8): a pom that still
+# says `<maven.compiler.release>1.8</maven.compiler.release>` makes javac report
+# "release version 1.8 not supported", and a bare `(\d+)` captured the "1" — which
+# surfaced to the user as the impossible advice "please install JDK 1". Mirrors
+# `_JAVA_REL_TAGS` in verification_plan.py, which already normalised 1.x this way.
 _JAVA_RELEASE_ERR = re.compile(
-    r"(?:invalid (?:target|source) release:\s*|release version\s+)(\d+)", re.I)
-#   "Source option 6 is no longer supported. Use 7 or later."
-_JAVA_OPTION_ERR = re.compile(r"(?:Source|Target) option\s+(\d+)\s+is no longer supported", re.I)
+    r"(?:invalid (?:target|source) release:\s*|release version\s+)(?:1\.)?(\d+)", re.I)
+#   "Source option 6 is no longer supported. Use 7 or later."  (legacy: "1.6")
+_JAVA_OPTION_ERR = re.compile(
+    r"(?:Source|Target) option\s+(?:1\.)?(\d+)\s+is no longer supported", re.I)
 # Dependency-resolution / plugin-resolution / repository-auth / offline-cache
 # failures. These mean the build environment (the warmed ~/.m2 + nexus access),
 # not the generated code, is broken — e.g. an offline `mvn -o` whose local cache
@@ -143,11 +149,24 @@ def parse_maven_output(
             result.build_success = False if failed else (result.build_success is not False)
             continue
 
-        # AGENTIC_VERIFY_SKIP_MODULES: a missing-reactor-module or dependency-resolution
-        # failure that names an out-of-scope module (or occurs while building one) is
-        # recorded 'soft' — NOT an environment/hard failure — so it never fails the gate.
-        if skip_pats and (_DEP_RESOLVE_ERR.search(line) or _CHILD_MODULE_MISSING.search(line)) \
-                and (_skip(line) or _skip(current_module)):
+        # AGENTIC_VERIFY_SKIP_MODULES: a missing-reactor-module, dependency-resolution
+        # or JDK-version failure that names an out-of-scope module (or occurs while
+        # building one) is recorded 'soft' — NOT an environment/hard failure — so it
+        # never fails the gate.
+        #
+        # The JDK cases belong here too. The exclusion list used to be consulted only for
+        # dependency/reactor failures, on the assumption that a toolchain gap is repo-wide.
+        # That does not hold for a mixed reactor: a single legacy module pinned to an old
+        # Java release aborts `mvn install` for the whole repo, and because javac dies
+        # before emitting any `file:line` diagnostic, `error_count` stays 0 and
+        # `is_environment_failure` condemned every module the operator had already
+        # declared out of scope. Maven names the culprit on the failing line itself
+        # ("... on project iupi-gateway-common: ... release version 1.8 not supported"),
+        # so `_skip(line)` attributes it correctly even when `current_module` is unset —
+        # which it often is, since the reactor aborts mid-module.
+        env_sig = (_DEP_RESOLVE_ERR.search(line) or _CHILD_MODULE_MISSING.search(line)
+                   or _JAVA_RELEASE_ERR.search(line) or _JAVA_OPTION_ERR.search(line))
+        if skip_pats and env_sig and (_skip(line) or _skip(current_module)):
             result.diagnostics.append(MavenDiagnostic(
                 severity="soft", message=line.strip()[:300], module=current_module))
             continue
