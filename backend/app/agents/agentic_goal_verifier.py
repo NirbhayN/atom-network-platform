@@ -197,6 +197,10 @@ async def run_goal_verifier(db, *, run_id: str, ctx, change_set, intent: str = "
     # (its default), crashing the whole verification panel. Blank setting = the
     # active provider's own model, mirroring agentic_review.py.
     model = reviewer_model or settings.agentic_reviewer_model or get_model()
+    if str(model).strip().lower() == str(get_model()).strip().lower():
+        logger.warning("goal_verifier: the skeptic panel runs on the AUTHOR'S model (%s) — "
+                       "self-review blind spot; set AGENTIC_REVIEWER_MODEL for independent "
+                       "eyes", model)
     panel = max(1, int(getattr(settings, "agentic_verifier_panel_size", 3) or 3))
     diff_text = _render_diff(workspace_run_id or run_id, change_set)
     user = build_evidence_user_prompt(

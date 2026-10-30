@@ -51,6 +51,10 @@ class ContextPack:
     # Every truncation marker in the rendered plan digests points here — the digest may
     # clip, this must not. Empty when no ratified analysis exists.
     plan_sections: dict[str, str] = field(default_factory=dict)
+    # C6 — grounding sources that FAILED to load during assembly (impact graph, file
+    # census, plan sections, …). Rendered into the prompt so "empty" is never
+    # mistaken for "checked and absent", and the agent knows to verify with tools.
+    degraded: list[str] = field(default_factory=list)
     # {repo_id: {extension: count}} — every file extension actually present in the
     # clone. Purely DERIVED by walking the workspace: no extension list, no language
     # or schema-format knowledge, so a Python/Protobuf repo censuses as such. See
@@ -290,7 +294,7 @@ def module_notes(db, selected_repo_ids: list[str], run_id: str | None = None) ->
     return out
 
 
-def _impact_files(db, descriptions: list[str | None]) -> list[str]:
+def _impact_files(db, descriptions: list[str | None], degraded: list | None = None) -> list[str]:
     """Blast-radius files for the context pack. Advisory, never a gate.
 
     Backend is chosen by ``settings.impact_backend`` ("sql" default | "age").
@@ -303,11 +307,11 @@ def _impact_files(db, descriptions: list[str | None]) -> list[str]:
     if not desc:
         return []
     if getattr(settings, "impact_backend", "sql") == "age":
-        return _impact_files_age(db, desc)
-    return _impact_files_sql(db, desc)
+        return _impact_files_age(db, desc, degraded)
+    return _impact_files_sql(db, desc, degraded)
 
 
-def _impact_files_sql(db, desc: str) -> list[str]:
+def _impact_files_sql(db, desc: str, degraded: list | None = None) -> list[str]:
     """Blast radius via the pure-SQL graph (kg/sql_graph) — no AGE. Extracts
     symbol seeds from the description (same extractor the AGE path uses), then
     unions the seed symbols' own files with their inbound callers. Each query is
@@ -323,22 +327,30 @@ def _impact_files_sql(db, desc: str) -> list[str]:
         files = list(dict.fromkeys(c["source_file"] for c in chunks if c.get("source_file")))
         return files[:25]
     except Exception as e:  # noqa: BLE001
-        logger.debug("impact analysis (sql) failed (fail-open): %s", e)
+        logger.warning("impact analysis (sql) failed (fail-open): %s", e)
+        if degraded is not None:
+            degraded.append("impact/blast-radius analysis FAILED (symbol graph unavailable) — "
+                            "the likely-affected-files list is absent, not empty; map the blast "
+                            "radius yourself via symbol_graph/callers before editing shared code")
         return []
 
 
-def _impact_files_age(db, desc: str) -> list[str]:
+def _impact_files_age(db, desc: str, degraded: list | None = None) -> list[str]:
     """Legacy Apache AGE / Cypher blast-radius path. Fail-open ([])."""
     try:
         from app.kg.impact_analyzer import analyze_impact
         report = analyze_impact(db=db, change_description=desc[:5000])
         return list(report.files_affected[:25])
     except Exception as e:  # noqa: BLE001
-        logger.debug("impact analysis (age) failed (fail-open): %s", e)
+        logger.warning("impact analysis (age) failed (fail-open): %s", e)
+        if degraded is not None:
+            degraded.append("impact/blast-radius analysis FAILED (AGE graph unavailable) — "
+                            "the likely-affected-files list is absent, not empty; map the blast "
+                            "radius yourself via symbol_graph/callers before editing shared code")
         return []
 
 
-def _plan_sections(db, change_request_id: str) -> dict[str, str]:
+def _plan_sections(db, change_request_id: str, degraded: list | None = None) -> dict[str, str]:
     """The RATIFIED Change-Analysis plan as ``{heading: body}`` for read_doc(doc='plan').
     Full fidelity (pretty-printed JSON per section) — this is the retrieval path behind
     every truncation marker in the rendered plan digests. Fail-open to {}."""
@@ -359,7 +371,11 @@ def _plan_sections(db, change_request_id: str) -> dict[str, str]:
                 out[name] = json.dumps(blob, indent=1, ensure_ascii=False, default=str)
         return out
     except Exception as e:  # noqa: BLE001 — optional context, never blocks assembly
-        logger.debug("plan sections load failed (fail-open): %s", e)
+        logger.warning("plan sections load failed (fail-open): %s", e)
+        if degraded is not None:
+            degraded.append("the RATIFIED PLAN failed to load (read_doc(doc='plan') is empty) — "
+                            "plan requirements are NOT visible here; flag this instead of "
+                            "treating the plan as having no deliverables")
         return {}
 
 
@@ -412,7 +428,8 @@ def _redact_doc_sections_for_llm(
         return sections
 
 
-def _file_census(repo_ids: list[str], run_id: str | None) -> dict[str, dict[str, int]]:
+def _file_census(repo_ids: list[str], run_id: str | None,
+                 degraded: list | None = None) -> dict[str, dict[str, int]]:
     """Count files by extension in each repo's clone: {repo_id: {ext: count}}.
 
     WHY. An analysis agent picks its own search patterns, and a plausible-looking
@@ -452,6 +469,9 @@ def _file_census(repo_ids: list[str], run_id: str | None) -> dict[str, dict[str,
                 out[rid] = counts
         except Exception:  # noqa: BLE001 — orientation aid, never blocks assembly
             logger.exception("file census failed repo=%s run=%s", rid, run_id)
+            if degraded is not None:
+                degraded.append(f"file census FAILED for repo {rid} — the extension inventory "
+                                "is incomplete; do not conclude a file class is absent from it")
     return out
 
 
@@ -474,6 +494,7 @@ def assemble_context_pack(
     mid-run does not change the contract the code agent is working against.
     None (the default, and every run created before this existed) preserves the
     prior "always latest" behaviour exactly."""
+    degraded: list[str] = []   # C6 — grounding sources that failed to load (rendered in-prompt)
     repos = repo_scope.validate_selection(db, selected_repo_ids)   # §5 hard gate
     repo_ids = [r.id for r in repos]
     base_sha = dict(repo_base_sha or {})
@@ -511,13 +532,14 @@ def assemble_context_pack(
         # external LLM call, so T6 (which is specifically about what crosses the
         # boundary to an external provider) does not apply to it. Redacting here
         # would only degrade impact-file matching for no privacy gain.
-        impact_files=_impact_files(db, [intent, tsd, brd]),
-        file_census=_file_census(repo_ids, run_id),
+        impact_files=_impact_files(db, [intent, tsd, brd], degraded),
+        file_census=_file_census(repo_ids, run_id, degraded),
         brd_sections=_redact_doc_sections_for_llm(doc_sections(brd), "brd", run_id),
         tsd_sections=_redact_doc_sections_for_llm(doc_sections(tsd), "tsd", run_id),
         assessment_sections=_redact_doc_sections_for_llm(
             doc_sections(assessment), "assessment", run_id),
         plan_sections=_redact_doc_sections_for_llm(
-            _plan_sections(db, change_request_id), "plan", run_id),
+            _plan_sections(db, change_request_id, degraded), "plan", run_id),
         intent=intent or "",
+        degraded=degraded,
     )

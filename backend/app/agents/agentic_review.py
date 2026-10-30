@@ -422,6 +422,14 @@ async def run_review(db, *, run_id: str, ctx, change_set, xsd_scope=None, intent
     # vendor's id.
     model = (reviewer_model or (settings.agentic_reviewer_model or "").strip()
              or get_model())
+    if str(model).strip().lower() == str(get_model()).strip().lower():
+        # C1 — the self-review blind spot made LOUD: a model misses in its own output
+        # the defect classes it catches in others'. Which model id to use is a
+        # deployment decision (depends on what the gateway carries), so this stays a
+        # warning, not a default.
+        logger.warning("review: the reviewer runs on the AUTHOR'S model (%s) — self-review "
+                       "blind spot; set AGENTIC_REVIEWER_MODEL to a different model for "
+                       "independent eyes", model)
     if str(model).strip().lower() != str(get_model()).strip().lower() \
             and "claude" not in str(model).lower():
         # Non-Claude reviewer (different-vendor eyes): setting the model id IS the opt-in —

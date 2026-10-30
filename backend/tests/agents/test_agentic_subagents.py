@@ -392,3 +392,16 @@ def test_resume_routes_followup_to_first_tooluse_when_no_gate_present():
     ]}
     out = S._analysis_resume_messages(_base_transcript(last), "answers here")
     assert "answers here" in out[-1]["content"][0]["content"]
+
+
+def test_degraded_grounding_is_rendered_loudly():
+    # C6 — a failed grounding source must be SAID in the prompt, never mistaken for
+    # "checked and found nothing".
+    from app.agents.agentic_subagents import build_system_segments
+    from app.agents.context_assembler import ContextPack
+    ctx = ContextPack(selected_repo_ids=["r1"],
+                      degraded=["impact/blast-radius analysis FAILED (symbol graph unavailable)"])
+    text = str(build_system_segments(ctx, "preface"))
+    assert "CONTEXT DEGRADED" in text and "symbol graph unavailable" in text
+    clean = ContextPack(selected_repo_ids=["r1"])
+    assert "CONTEXT DEGRADED" not in str(build_system_segments(clean, "preface"))

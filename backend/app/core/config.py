@@ -878,14 +878,16 @@ class Settings(BaseSettings):
     # OpenAI upstreams. The id must start with gpt/o1/o3/o4:
     # AiNxt silently routes unrecognized ids to its default model, so run_review rejects those loudly.
     agentic_reviewer_model: str = ""
-    # ── Reviewer mode (grok-style goal-verifier vs the legacy gate loop) ──────────────
-    # "goal_verifier" (default): an adversarial skeptic panel returns a grok-shaped verdict
-    #   (refuted + findings + blocking-kind), convergence is driven by a path:line gap
-    #   fingerprint (stall → stop, not ride the round cap), the deterministic gates become
-    #   ADVISORY suspects the verifier confirms/dismisses, and contradiction/unverifiable
-    #   route to the human gate. See agentic_goal_verifier.py + goal_verifier_core.py.
-    # "legacy" (set AGENTIC_REVIEWER_MODE=legacy to fall back): the pre-existing _phase_review
-    #   gate loop (contract/DI/plan-fidelity gates + adversarial reviewer).
+    # ── Reviewer mode ──────────────────────────────────────────────────────────────
+    # "legacy" (the DEFAULT — slipstream posture): one adversarial review pass per round
+    #   through _phase_review, with the deterministic gates in advise mode; convergence
+    #   comes from the real build verdict and the human gate, not review bureaucracy.
+    # "goal_verifier" (opt-in, heavier): a grok-style skeptic PANEL returns a quorum
+    #   verdict (refuted + findings + blocking-kind), convergence is driven by a
+    #   path:line gap fingerprint (stall → stop), deterministic gates become ADVISORY
+    #   suspects the panel confirms/dismisses, and contradiction/unverifiable route to
+    #   the human gate. See agentic_goal_verifier.py + goal_verifier_core.py. Costs up
+    #   to panel-size× per review round; flip it on for high-stakes deployments.
     agentic_reviewer_mode: str = "legacy"
     # Skeptic panel size for goal_verifier mode. 3 (grok default) gives a majority vote;
     # skeptic 0 runs first and a high-confidence decisive refute short-circuits the rest, so
@@ -1263,14 +1265,6 @@ class Settings(BaseSettings):
     # for the per-symbol NL summary phase without affecting other utility-
     # purpose agents (compressor, validators, ambiguity_detector, etc.).
     code_summarizer_model: str = ""
-
-    # Adversarial-reviewer model override. The reviewer SHOULD NOT be the same model as the
-    # code author (code_change) — a model has a documented "self-correction blind spot" (it
-    # misses in its own output the same defects it catches in others'). Set this to a
-    # different (equal-or-stronger) model id the provider serves, e.g. "claude-opus-4-8"
-    # while code_change runs on Sonnet. Empty = inherit the normal routing (same model as
-    # today — inert), so flag-off behaviour is unchanged. Read in adversarial_reviewer.py.
-    adversarial_reviewer_model: str = ""
 
     # Critic LLM defaults.
     # Per-checkpoint overrides live in `app_configs` under the

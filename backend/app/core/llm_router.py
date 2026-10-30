@@ -85,14 +85,13 @@ _AGENT_PURPOSE: dict[str, Purpose] = {
     # Plan-fidelity gate (did the code DELIVER the plan + is the hard part real, not faked).
     # Reasoning — it reasons about a diff against intended behaviours, not a classification.
     "plan_fidelity":    Purpose.REASONING,
-    # SECURITY NOTE: adversarial review shares Purpose.REASONING (and therefore
-    # the same model) as code_change by default. This means the same model grades
-    # its own output — a structural weakness for self-review. Mitigation:
-    # `settings.agentic_reviewer_model` routes the agentic reviewer (run_review)
-    # to a dedicated reviewer model (a claude id, or a gpt/o1/o3/o4 id via the AiNxt
-    # anthropic-compat route); set it so the reviewer is never the same
-    # LLM as the author.
-    "adversarial":      Purpose.REASONING,
+    # SECURITY NOTE: the review loop shares Purpose.REASONING (and therefore the
+    # same model) as code_change by default — the same model grades its own output,
+    # a structural self-review weakness, now logged loudly at review time.
+    # Mitigation: `settings.agentic_reviewer_model` routes the reviewer (run_review
+    # and the goal-verifier panel) to a dedicated model (a claude id, or a
+    # gpt/o1/o3/o4 id via the AiNxt anthropic-compat route); set it so the reviewer
+    # is never the same LLM as the author.
     # Governance stages (EA → InfoSec pre-build gates): rule-by-rule review over the
     # whole diff + a surgical fixer — frontier-tier. The stage reviewer additionally
     # routes through settings.agentic_reviewer_model (different eyes), like run_review.

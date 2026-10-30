@@ -42,3 +42,9 @@ def test_loops_are_budget_bound_not_round_capped():
     assert _default("agentic_max_code_continuations") == 64
     assert _default("agentic_max_code_attempts") == 40
     assert _default("agentic_token_budget_enforce") is True   # the bound that remains
+
+
+def test_reviewer_mode_defaults_to_the_single_pass_loop():
+    # C2 — config default and the orchestrator's getattr fallback must agree
+    # ("legacy"); the docstring/fallback used to claim goal_verifier was default.
+    assert _default("agentic_reviewer_mode") == "legacy"

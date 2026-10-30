@@ -1941,8 +1941,13 @@ def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = Tr
     ``app_blast_radius`` False (Phase A) → compile schema + install core to ~/.m2 only;
     True (Phase B) → also full-build app consumers so a broken caller fails the gate."""
     verifier = select_verifier()
+    # C5 — TSD-declared test assertions make feature-test EXECUTION mandatory for this
+    # change (targeted, not the blanket agentic_run_feature_tests flag): a TSD that
+    # names observable behaviours is only verified when the change's own tests RAN.
+    _force_ft = bool((art or {}).get("tsd_assertions"))
     outcome = verifier.verify(db, _ws_id(run), _disk_change_set(db, run),
-                              app_blast_radius=app_blast_radius)
+                              app_blast_radius=app_blast_radius,
+                              force_feature_tests=_force_ft)
     errors = verification_plan.format_errors(outcome)
     modules = getattr(outcome, "module_results", {}) or {}
     art["verification"] = {"status": outcome.status, "gates": outcome.gates,
@@ -1963,6 +1968,21 @@ def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = Tr
         "unverified": f"⚠ Could not verify — {outcome.reason}",
     }.get(outcome.status, outcome.status)
     emit_event(db, run.id, "verification", {**art["verification"], "action": action})
+    if outcome.status == "unverified":
+        # C4 — an unverified completion must be UNMISSABLE at the approval gate: this
+        # change was NEVER BUILT. Persisted on the run (survives event scroll) and
+        # emitted as its own loud event.
+        try:
+            _h = dict(run.handoff_json or {})
+            _h["unverified"] = {"reason": outcome.reason, "backend": verifier.name}
+            run.handoff_json = _h
+        except Exception:  # noqa: BLE001 — the flag must never break the phase
+            logger.debug("could not persist unverified flag", exc_info=True)
+        emit_event(db, run.id, "verify_unverified", {
+            "reason": outcome.reason,
+            "action": "🟠 NEVER BUILT — this change reaches approval WITHOUT a build "
+                      f"({outcome.reason}). Run CI or install mvn/javac and use "
+                      "Re-verify before approving the push."})
     return outcome.status
 
 
@@ -2387,7 +2407,10 @@ async def _phase_review(db, run: AgenticRun, art: dict, model) -> bool:
     # The goal-verifier path returns here with a legacy-compatible art['review']; the
     # deterministic gates below run only in the legacy path (they feed the verifier as
     # advisory suspects instead). Set AGENTIC_REVIEWER_MODE=legacy to fall back.
-    if (getattr(settings, "agentic_reviewer_mode", "goal_verifier") or "goal_verifier") == "goal_verifier":
+    # C2 — the fallback matches the config DEFAULT ("legacy", slipstream posture); it
+    # used to say "goal_verifier", so a config-skewed environment silently ran the
+    # heavier panel the operator never chose.
+    if (getattr(settings, "agentic_reviewer_mode", "legacy") or "legacy") == "goal_verifier":
         return await _phase_review_goal_verifier(
             db, run, art, model, rounds=rounds, cs_disk=_cs_disk,
             plan_block=plan_block, directives=_directives, prior=_prior)

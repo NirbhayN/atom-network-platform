@@ -630,11 +630,18 @@ def build_system_segments(ctx: ContextPack, preface: str) -> list[dict]:
         repos = "Selected repos: " + ", ".join(ctx.selected_repo_ids)
     impact = ("Likely-affected files (advisory):\n- " + "\n- ".join(ctx.impact_files)
               ) if ctx.impact_files else ""
+    # C6 — degraded grounding is said OUT LOUD: an empty impact list / census / plan
+    # that failed to load must never read as "checked and found nothing".
+    _degraded = getattr(ctx, "degraded", None) or []
+    degraded = ("⚠ CONTEXT DEGRADED — these grounding sources FAILED to load (absent, not "
+                "empty). Verify the missing ground yourself with tools before relying on "
+                "anything's absence:\n- " + "\n- ".join(_degraded)) if _degraded else ""
     return segments_for_prompt_cache([
         (preface, True),
         (_module_block(ctx), True),
         (docs, True),
-        ("\n".join(p for p in (repos, _census_block(ctx), impact, _stale_banner(ctx)) if p), False),
+        ("\n".join(p for p in (repos, _census_block(ctx), impact, degraded,
+                               _stale_banner(ctx)) if p), False),
     ])
 
 

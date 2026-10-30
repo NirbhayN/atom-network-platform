@@ -32,12 +32,16 @@ logger = logging.getLogger("app.agentic")
 class Verifier(Protocol):
     name: str
 
-    def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True) -> VerificationOutcome:
+    def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True,
+               force_feature_tests: bool = False) -> VerificationOutcome:
         """Verify ``change_set`` (an object exposing ``.operations``) for ``run_id``.
 
         ``app_blast_radius`` (default True) → on a schema/core change, full-build the
         in-scope app repos so a broken consumer fails the gate. Phase A passes False
-        (compile schema + install core to ~/.m2 only; app rebuild is Phase B's job)."""
+        (compile schema + install core to ~/.m2 only; app rebuild is Phase B's job).
+        ``force_feature_tests`` (C5) → run the change's own test classes even when the
+        blanket agentic_run_feature_tests flag is off — set when the TSD declares test
+        assertions for this change."""
         ...
 
 
@@ -47,16 +51,19 @@ class LocalToolchainVerifier:
 
     name = "local"
 
-    def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True) -> VerificationOutcome:
+    def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True,
+               force_feature_tests: bool = False) -> VerificationOutcome:
         plan, touched = verification_plan.build_plan(db, run_id, change_set,
                                                      app_blast_radius=app_blast_radius)
         if not plan:
             # Nothing buildable changed (e.g. docs only) — there's nothing to fail.
             return VerificationOutcome(status="verified", gates={}, plan=[])
         # 3c — append scoped test steps (RUN the change's own test classes) so a green verdict means
-        # the behaviour RAN, not just compiled. Gated (agentic_run_feature_tests) + no-op when the
-        # change owns no tests. A failure → required_tests (loops back); infra → environment (fail-open).
-        verification_plan.append_feature_test_steps(plan, run_id, change_set)
+        # the behaviour RAN, not just compiled. Gated (agentic_run_feature_tests) OR forced when the
+        # TSD declares test assertions (C5) + no-op when the change owns no tests. A failure →
+        # required_tests (loops back); infra → environment (fail-open).
+        verification_plan.append_feature_test_steps(plan, run_id, change_set,
+                                                    force=force_feature_tests)
         _ft = None
         if getattr(settings, "agentic_require_feature_tests", True):   # WS3a — require a real feature test
             _ok, _why = verification_plan.feature_test_gate(change_set)
@@ -75,7 +82,8 @@ class DeferredVerifier:
     def __init__(self, reason: str = "no local build toolchain — deferred to CI"):
         self._reason = reason
 
-    def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True) -> VerificationOutcome:
+    def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True,
+               force_feature_tests: bool = False) -> VerificationOutcome:
         return VerificationOutcome(status="unverified", gates={}, reason=self._reason)
 
 

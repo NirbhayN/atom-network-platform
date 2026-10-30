@@ -811,3 +811,24 @@ def test_soft_exclusion_still_covers_a_genuinely_broken_module(monkeypatch, tmp_
     assert out.status == "verified" and out.gates["compile"] is True
     assert any(c[1] for c in ex.calls), "the rescue was attempted first"
     assert out.module_results["core (full build)"]["errors"] == [], "plain soft-pass"
+
+
+def test_tsd_assertions_force_feature_test_steps(monkeypatch):
+    # C5 — a TSD that declares test assertions forces the change's own tests to RUN
+    # even with the blanket agentic_run_feature_tests flag OFF.
+    monkeypatch.setattr(_settings, "agentic_run_feature_tests", False, raising=False)
+    cs = SimpleNamespace(operations=[
+        SimpleNamespace(op="add", path="src/test/java/RefundFlowTest.java", repo_id="r1")])
+    plan: list = []
+    V.append_feature_test_steps(plan, RUN, cs)                 # flag off, not forced → no-op
+    assert plan == []
+    V.append_feature_test_steps(plan, RUN, cs, force=True)     # forced by TSD assertions
+    assert len(plan) == 1 and plan[0].kind == "test"
+    assert any(a.startswith("-Dtest=") and "RefundFlowTest" in a for a in plan[0].argv)
+
+
+def test_deferred_verifier_accepts_force_kwarg():
+    from app.agents.verifier import DeferredVerifier
+    out = DeferredVerifier("no toolchain").verify(None, RUN, SimpleNamespace(operations=[]),
+                                                  force_feature_tests=True)
+    assert out.status == "unverified" and "no toolchain" in out.reason

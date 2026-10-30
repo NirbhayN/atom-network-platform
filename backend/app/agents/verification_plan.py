@@ -631,7 +631,7 @@ def _mvn_test(module: str | None, test_classes: list[str]) -> list[str]:
     return argv
 
 
-def append_feature_test_steps(plan: list, run_id: str, change_set) -> None:
+def append_feature_test_steps(plan: list, run_id: str, change_set, *, force: bool = False) -> None:
     """3c — append a test step per module that RUNS the change's OWN test classes (added/modified
     ``*Test.java``), so a green verdict means the behaviour RAN, not just compiled. Scoped by
     ``-Dtest`` to the change's classes → a failure is about THIS change only, never an unrelated
@@ -639,7 +639,9 @@ def append_feature_test_steps(plan: list, run_id: str, change_set) -> None:
     owns no tests. Mutates ``plan`` in place, appending AFTER the install steps so classes are built
     first. run_plan maps a test failure → required_tests (needs_fix → loops back) and an
     infra/toolchain problem → environment (unverified → fail-open, never loops)."""
-    if not getattr(settings, "agentic_run_feature_tests", False):
+    # `force` (C5): the TSD declared test assertions for this change — its own tests
+    # must RUN regardless of the blanket flag.
+    if not (force or getattr(settings, "agentic_run_feature_tests", False)):
         return
     by_module: dict[tuple, list[str]] = {}
     for op in (getattr(change_set, "operations", None) or []):
