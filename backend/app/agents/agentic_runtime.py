@@ -267,6 +267,45 @@ def _compact_messages(messages: list[dict], keep_tail: int) -> int:
     return reclaimed
 
 
+def _evict_superseded_reads(messages: list[dict], repo_id: str, path: str) -> int:
+    """A successful edit of ``path`` makes every OLDER read_file output for it stale by
+    definition — evict those NOW (supersede-aware) instead of letting dead bytes wait for
+    the compaction threshold. Only the tool_result CONTENT is replaced with a stub; block
+    ids and tool_use/tool_result pairing are untouched, so the protocol stays valid. The
+    read that anchored the edit has served its purpose — the anchor text lives on in the
+    edit's own tool_use input. Same-turn reads are safe: their results are appended after
+    this runs. Returns chars reclaimed."""
+    if not path:
+        return 0
+    reclaimed = 0
+    stale_ids: set = set()
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        if m.get("role") == "assistant":
+            for b in c:
+                if (isinstance(b, dict) and b.get("type") == "tool_use"
+                        and b.get("name") == "read_file"):
+                    inp = b.get("input") or {}
+                    # repo match: an exact match, or a read that omitted/wildcarded repo_id
+                    # (the resolver recovered it) — path identity is the real key.
+                    if (inp.get("path") == path
+                            and (inp.get("repo_id") or repo_id) in (repo_id, "all")):
+                        stale_ids.add(b.get("id"))
+        elif m.get("role") == "user" and stale_ids:
+            for b in c:
+                if (isinstance(b, dict) and b.get("type") == "tool_result"
+                        and b.get("tool_use_id") in stale_ids):
+                    txt = b.get("content")
+                    if (isinstance(txt, str) and len(txt) > _EVICT_MIN_CHARS
+                            and not txt.startswith("[evicted")):
+                        reclaimed += len(txt)
+                        b["content"] = (f"[evicted — this read of {path} is superseded by your "
+                                        "edit; re-read the file if you need its current content]")
+    return reclaimed
+
+
 def _reclaimable_tool_chars(messages: list[dict], keep_tail: int) -> int:
     """Chars ``_compact_messages`` WOULD reclaim right now — non-stub tool outputs above the
     evict floor, outside the kept tail. Zero means the history is already maximally compacted:
@@ -913,6 +952,7 @@ async def run_agent_loop(
                 # the bulk is evicted). Fail-open inside _pin_progress_summary.
                 _summarized = await _pin_progress_summary(messages, system, model, agent_name, None)
                 _reclaimed = _compact_messages(messages, settings.agentic_compact_keep_recent_turns)
+                ctx.fresh_reads.clear()   # evicted reads must not be served as "unchanged" stubs
                 if not _summarized:
                     _note_unsummarized_eviction(messages)
                 _pin_ground_truth(messages, ctx)
@@ -947,6 +987,7 @@ async def run_agent_loop(
                            agent_name, run_id, i + 1, e)
             _summarized = await _pin_progress_summary(messages, system, model, agent_name, None)
             _reclaimed = _compact_messages(messages, keep_tail=2)
+            ctx.fresh_reads.clear()       # evicted reads must not be served as "unchanged" stubs
             _pin_ground_truth(messages, ctx)
             if not _summarized:
                 _note_unsummarized_eviction(messages)
@@ -1085,6 +1126,7 @@ async def run_agent_loop(
                                                       turn.assistant_content)
             # 2) Evict the bulky, reconstructable tool outputs.
             _reclaimed = _compact_messages(messages, settings.agentic_compact_keep_recent_turns)
+            ctx.fresh_reads.clear()       # evicted reads must not be served as "unchanged" stubs
             # 3) Re-inject the DETERMINISTIC run state (edited files, plan) — the summary
             #    above is an LLM's recollection; this block is the harness's record.
             _pin_ground_truth(messages, ctx)
@@ -1198,6 +1240,18 @@ async def run_agent_loop(
             except Exception:
                 pass
             results.append(tool_result_block(tu.id, text, is_error=is_error))
+            # Supersede-aware eviction: a landed edit makes every earlier read of that file
+            # stale — reclaim those bytes now, not at the next compaction threshold. The
+            # "edited " prefix distinguishes a real write from a staged/skipped schema write
+            # (those leave the file untouched, so earlier reads remain current).
+            if (tu.name == "edit_file" and not is_error
+                    and isinstance(text, str) and text.startswith("edited ")):
+                _sup = _evict_superseded_reads(
+                    messages, (tu.input or {}).get("repo_id") or "", (tu.input or {}).get("path") or "")
+                if _sup:
+                    logger.info("agent_loop[%s] run=%s iter=%d evicted %d chars of reads "
+                                "superseded by edit of %s", agent_name, run_id, i, _sup,
+                                (tu.input or {}).get("path"))
 
         # Decision gate: propose_approach asked to stop for the human's reuse-vs-new
         # choice — end this pass cleanly (no edits happened; the orchestrator gates here).

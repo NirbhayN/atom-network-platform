@@ -556,3 +556,46 @@ def test_submit_plan_rejects_non_list_files_short_intent_and_non_dict_entries(ws
     with pytest.raises(T.ToolError):
         T.submit_plan(ctx, "entry is not a dict", files=["src/A.java"])
     assert ctx.plan is None
+
+
+# ── Unchanged-read stubs: a repeat full read of an unchanged file re-sends nothing ──
+
+def test_unchanged_full_reread_returns_stub_not_content(ws):
+    ctx = _ctx()
+    assert "int x = 1;" in T.read_file(ctx, RID, "src/A.java")
+    again = T.read_file(ctx, RID, "src/A.java")
+    assert "UNCHANGED since your last full read" in again and "int x = 1;" not in again
+    # Ranged reads are the escape hatch (refetch after compaction) — always served.
+    assert "int x = 1;" in T.read_file(ctx, RID, "src/A.java", start_line=1, end_line=3)
+
+
+def test_reread_after_own_edit_serves_real_content_then_rearms(ws):
+    ctx = _ctx()
+    T.read_file(ctx, RID, "src/A.java")
+    T.edit_file(ctx, RID, "src/A.java", old_string="int x = 1;", new_string="int x = 2;")
+    out = T.read_file(ctx, RID, "src/A.java")
+    assert "int x = 2;" in out and "UNCHANGED" not in out, "post-edit copy in context is stale"
+    assert "UNCHANGED" in T.read_file(ctx, RID, "src/A.java")   # fresh again after that read
+
+
+def test_reread_after_external_change_serves_real_content(ws):
+    ctx = _ctx()
+    T.read_file(ctx, RID, "src/A.java")
+    (ws / "src" / "A.java").write_text("class A {\n    int x = 99;\n}\n")
+    assert "int x = 99;" in T.read_file(ctx, RID, "src/A.java")
+
+
+def test_compaction_cleared_registry_serves_full_content(ws):
+    # The runtime clears fresh_reads whenever it evicts tool outputs — a stub must
+    # never point at content the model can no longer see.
+    ctx = _ctx()
+    T.read_file(ctx, RID, "src/A.java")
+    ctx.fresh_reads.clear()
+    assert "int x = 1;" in T.read_file(ctx, RID, "src/A.java")
+
+
+def test_created_file_reread_is_stubbed(ws):
+    # The agent authored every byte of a created file — it is in context verbatim.
+    ctx = _ctx()
+    T.create_file(ctx, RID, "src/B.java", "class B {}\n")
+    assert "UNCHANGED" in T.read_file(ctx, RID, "src/B.java")

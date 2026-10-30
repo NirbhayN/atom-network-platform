@@ -103,6 +103,14 @@ class RunContext:
     # old_string anchor targets content it never read — refuse and force a re-read
     # instead of landing an edit against a stale mental model.
     read_hashes: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Files whose FULL, CURRENT content is still verbatim in the conversation — a repeat
+    # full read of an unchanged member returns a short "unchanged" stub instead of
+    # re-sending the body (the habitual re-read of a big file is the single largest
+    # context-bloat source). Maintained strictly: an edit discards the entry (the
+    # in-context copy is stale), and the runtime CLEARS the whole set whenever
+    # compaction evicts tool outputs (a stub must never point at evicted content).
+    # Distinct from `full_reads`, which is the append-only evidence record.
+    fresh_reads: set[tuple[str, str]] = field(default_factory=set)
     # Full outputs of truncated run_command calls, keyed "out<N>" — retrievable (paged)
     # via the read_output tool instead of forcing an expensive/non-reproducible re-run.
     command_outputs: dict[str, str] = field(default_factory=dict)
@@ -282,8 +290,23 @@ def read_file(ctx: RunContext, repo_id: str | None = None, path: str | None = No
         head = "\n".join(text.splitlines()[:_BIG_FILE_HEAD_LINES])
         return (f"[{path} is large ({nlines} lines) — first {_BIG_FILE_HEAD_LINES} lines shown; call "
                 f"read_file with start_line/end_line for any other range.]\n{head}")
-    ctx.read_files.add((repo_id, path))
-    ctx.read_hashes[(repo_id, path)] = _sha256(text)    # full-file hash even for a ranged read
+    key = (repo_id, path)
+    digest = _sha256(text)
+    # Unchanged-read stub: a repeat FULL read of a file that hasn't changed on disk and
+    # whose full content is still verbatim in the conversation re-sends nothing — the
+    # model already has it. A ranged read is always served (it is the escape hatch: if
+    # the earlier content was compacted away, any range — e.g. 1..N — refetches text),
+    # and the runtime clears `fresh_reads` whenever compaction evicts tool outputs, so
+    # this stub can never point at content the model no longer sees.
+    if (not (start_line or end_line) and key in ctx.fresh_reads
+            and ctx.read_hashes.get(key) == digest):
+        nlines = text.count("\n") + 1
+        return (f"[{path} UNCHANGED since your last full read ({nlines} lines) — content not "
+                "re-sent; it is already in your context above. If that earlier read is no "
+                "longer visible (compacted away), call read_file with start_line/end_line "
+                "to refetch the part you need.]")
+    ctx.read_files.add(key)
+    ctx.read_hashes[key] = digest                       # full-file hash even for a ranged read
 
     body = text
     if start_line or end_line:
@@ -295,7 +318,8 @@ def read_file(ctx: RunContext, repo_id: str | None = None, path: str | None = No
         # outside every read range is not verified by it (_verify_evidence).
         ctx.read_ranges.setdefault((repo_id, path), []).append((lo + 1, min(hi, len(lines))))
     else:
-        ctx.full_reads.add((repo_id, path))
+        ctx.full_reads.add(key)
+        ctx.fresh_reads.add(key)
 
     notes = _module_notes(ctx, repo_id, path)
     return f"{notes}\n\n{body}" if notes else body
@@ -651,6 +675,9 @@ def edit_file(ctx: RunContext, repo_id: str, path: str,
     # file for a small change). Detection reads the CURRENT (pre-write) bytes.
     workspace_local.write_preserving_eol(target, new_content)
     ctx.read_hashes[(repo_id, path)] = _sha256(new_content)   # your own edit is "seen" content
+    # The full copy sitting in the conversation is now stale — a later full read must
+    # return the real post-edit content, not the unchanged-read stub.
+    ctx.fresh_reads.discard((repo_id, path))
     op = "add" if (repo_id, path) in ctx.file_ops and ctx.file_ops[(repo_id, path)].op == "add" else "modify"
     ctx.file_ops[(repo_id, path)] = FileOp(op, repo_id, path, new_content, _sha256(new_content))
     return (f"edited {path} (match level {level})\n{_edit_echo(new_content, new_string)}"
@@ -674,6 +701,7 @@ def create_file(ctx: RunContext, repo_id: str, path: str, content: str) -> str:
     workspace_local.write_preserving_eol(target, content)
     ctx.read_files.add((repo_id, path))      # a file you just wrote is "known"
     ctx.full_reads.add((repo_id, path))      # …in FULL: you authored every line of it
+    ctx.fresh_reads.add((repo_id, path))     # …and that authored content is in context verbatim
     ctx.read_hashes[(repo_id, path)] = _sha256(content)
     ctx.file_ops[(repo_id, path)] = FileOp("add", repo_id, path, content, _sha256(content))
     return f"created {path}" + _xsd_facet_warnings(path, content)

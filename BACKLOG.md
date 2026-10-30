@@ -7,19 +7,24 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 
 1. ✅ **Pull, don't pre-stuff** — context pack ships indexes only; code is pulled
    via tools. Remaining: A6, A7 below.
-2. 🔶 **Tool-result eviction** — threshold eviction to stubs exists; ⬜ ⚡ add
-   **supersede-aware eviction**: the moment `edit_file` rewrites a file, evict its
-   older read-contents from history instead of waiting for the 900K threshold.
-3. 🔶 **Auto-compact with structured state** — progress-summary pinning + plan in
-   system segments exist; ⬜ ⚡ **score the system segments** so `pack_within_budget`
-   can never drop the plan/decisions block before boilerplate; ⬜ harden the
-   summary-call overflow fallback (currently degrades to evict-without-summary).
+2. ✅ **Tool-result eviction** — threshold eviction to stubs, plus supersede-aware
+   eviction: the moment `edit_file` rewrites a file, every older read of it in
+   history is stubbed immediately (`_evict_superseded_reads`, protocol-safe,
+   respects the eviction floor; staged/skipped schema writes don't trigger it).
+3. ✅ **Auto-compact with structured state** — verified stronger than audited: the
+   brief (msg[0], carrying the plan) is protected by BOTH `trim_messages_to_fit`
+   and `_compact_messages`; system blocks are never trimmed at dispatch; the
+   summary call already has a two-step overflow ladder. Invariants now pinned by
+   tests. (Audit note: `pack_within_budget` — the "plan could drop" risk — turned
+   out to be UNCALLED dead code; candidate to wire into docgen or delete.)
 4. 🔶 **Subagent isolation** — phases are isolated; ⬜ add a read-only **scout
    subagent** inside the code phase: exploration happens in the child, the editor
    context carries only the brief.
-5. 🔶 **File-state tracking** — read files/ranges + hashes tracked; ⬜ ⚡
-   **unchanged-read stubs**: re-reading an unchanged file returns "unchanged since
-   iteration N", not full content.
+5. ✅ **File-state tracking** — a repeat FULL read of an unchanged file returns a
+   short "UNCHANGED since your last full read" stub (`ctx.fresh_reads`): an edit
+   discards the entry, external changes re-serve content (hash check), compaction
+   clears the registry so a stub never points at evicted content, and ranged
+   reads are always served (the refetch escape hatch).
 6. ⬜ Retire legacy `code_change.py` (pre-stuffs top-k RAG, 20KB KEEP/SKIP doc
    compression that can drop regulatory sections — the agentic path fixed this,
    the console path didn't).
@@ -95,3 +100,6 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
   (64 continuations / 40 attempts), hard stops = build verdict + token budget +
   human approval.
 - `submit_plan` validated at the door; 30+ scenario tests incl. pinned defaults.
+- Context discipline (pillars A2/A3/A5): supersede-aware eviction after edits,
+  unchanged-read stubs with compaction-safe invalidation, and compaction/trim
+  invariants (brief + assistant reasoning never evicted) pinned by tests.
