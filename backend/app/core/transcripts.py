@@ -73,7 +73,6 @@ _STAGE_FOLDERS: dict[str, str] = {
     "tech_spec": "06_tech_spec",
     "tech-spec": "06_tech_spec",
     "tsd": "06_tech_spec",
-    "code_planner": "07_planning",
     "planning": "07_planning",
     # The five agentic-loop stages nest under 08_codegen/<run_id>/<agent>/ via codegen_dir();
     # this mapping is the fallback if one is ever captured through the generic path.

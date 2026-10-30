@@ -116,6 +116,16 @@ def deterministic_findings(candidate: str, doc_type: str) -> list[str]:
             findings.extend(check(artifact))
         except Exception as exc:  # noqa: BLE001 — one broken check must not
             findings.append(f"check {check.__name__} errored: {exc}")  # hide the rest
+    if doc_type == "xsd":
+        # E2 — the XSD golden rides the SAME deterministic compile gate production
+        # applies (B2): well-formedness via stdlib everywhere, full XML Schema build
+        # when xmlschema is installed. A golden run and a real run can disagree only
+        # about the model output, never about the rules.
+        try:
+            from app.services.xsd_validation import compile_generated_schemas
+            findings.extend(f"schema compile: {e}" for e in compile_generated_schemas(candidate))
+        except Exception as exc:  # noqa: BLE001
+            findings.append(f"xsd compile check errored: {exc}")
     return findings
 
 
@@ -278,3 +288,38 @@ def semantic_score(candidate: str, golden: str, *, model: str) -> Score | None:
 
     reasons = [str(r) for r in (data.get("reasons") or [])][:10]
     return Score(max(0.0, min(1.0, value)), reasons, {"judge_model_pinned": 1.0})
+
+
+def plan_structural_score(candidate: dict, golden: dict) -> Score:
+    """Structural score for a CODE PLAN (E2) — the submit_plan/ChangeAnalysis shape.
+
+    Two independent layers, both offline and free:
+      * schema validity via the LIVE validator (`code_plan_schema.validate`) — the
+        same rules `submit_plan` enforces at the door, so a golden plan and a real
+        plan are judged by one set of rules;
+      * planned-file coverage against the golden — a plan that silently drops a
+        deliverable the accepted golden carried is the regression this measures
+        (the `plan_files` 13-dropped-files bug class, as a score).
+    Schema invalidity halves the score rather than zeroing it: a drifted-but-
+    complete plan is a lesser regression than a missing deliverable.
+    """
+    from app.agents.code_plan_schema import validate
+
+    findings: list[str] = []
+    report = validate(candidate if isinstance(candidate, dict) else {})
+    findings.extend(f"schema: {i}" for i in report["issues"])
+
+    def _paths(plan: dict) -> set[str]:
+        return {str(e.get("path") or "").strip()
+                for e in (plan.get("files") or []) if isinstance(e, dict)} - {""}
+
+    want, have = _paths(golden or {}), _paths(candidate if isinstance(candidate, dict) else {})
+    missing = sorted(want - have)
+    findings.extend(f"missing planned file: {m}" for m in missing)
+    coverage = 1.0 if not want else (len(want) - len(missing)) / len(want)
+    value = coverage * (1.0 if report["schema_valid"] else 0.5)
+    return Score(value, findings, {
+        "files_expected": float(len(want)),
+        "files_missing": float(len(missing)),
+        "schema_valid": 1.0 if report["schema_valid"] else 0.0,
+    })

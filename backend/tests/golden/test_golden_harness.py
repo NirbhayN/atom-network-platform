@@ -112,3 +112,38 @@ def test_semantic_scoring_reports_unavailable_rather_than_scoring_zero(monkeypat
 
     monkeypatch.setattr(settings, "llm_provider", "", raising=False)
     assert scoring.semantic_score("a", "b", model="pinned-model") is None
+
+
+# ── E2: XSD + code-plan golden cases ────────────────────────────────────────────────
+
+def test_xsd_golden_compiles_and_scores_above_floor():
+    from tests.golden.runner import FIXTURES
+    case = load_case("case_003")
+    score = score_candidate("case_003", golden_text("case_003"))
+    assert score.value >= case["thresholds"]["structural_min"], str(score)
+    assert not any("schema compile" in f for f in score.findings), str(score)
+
+
+def test_xsd_degraded_is_caught_by_sections_and_compile():
+    from tests.golden.runner import FIXTURES
+    case = load_case("case_003")
+    degraded = (FIXTURES / "case_003.degraded.md").read_text(encoding="utf-8")
+    score = score_candidate("case_003", degraded)
+    assert score.value < case["thresholds"]["structural_min"], str(score)
+    # The broken xml block is flagged by the stdlib well-formedness tier, so this
+    # holds even on hosts without the optional xmlschema dependency.
+    assert any("schema compile" in f for f in score.findings), str(score)
+
+
+def test_plan_golden_scores_full_and_degraded_is_caught():
+    import json
+    from tests.golden.runner import FIXTURES
+    from tests.golden.scoring import plan_structural_score
+    plans = FIXTURES / "plans"
+    golden = json.loads((plans / "plan_case_001.golden.json").read_text(encoding="utf-8"))
+    degraded = json.loads((plans / "plan_case_001.degraded.json").read_text(encoding="utf-8"))
+    assert plan_structural_score(golden, golden).value == 1.0
+    score = plan_structural_score(degraded, golden)
+    assert score.value < 0.5, str(score)                      # drift halves + dropped file
+    assert any("missing planned file" in f for f in score.findings)
+    assert any(f.startswith("schema:") for f in score.findings)

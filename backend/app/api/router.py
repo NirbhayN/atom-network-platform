@@ -13,6 +13,7 @@ from app.api.phase_b import router as phase_b_router
 from app.api.code_indexing import router as code_indexing_router
 from app.api.admin_build_smoke import router as admin_build_smoke_router
 from app.api.admin_llm_circuit import router as admin_llm_circuit_router
+from app.api.admin_agentic_metrics import router as admin_agentic_metrics_router
 from app.api.app_config import router as app_config_router
 from app.api.partners import router as partners_router
 from app.api.a2a import router as a2a_router
@@ -75,6 +76,7 @@ api_router.include_router(code_indexing_router)
 api_router.include_router(app_config_router)
 api_router.include_router(admin_build_smoke_router)
 api_router.include_router(admin_llm_circuit_router)
+api_router.include_router(admin_agentic_metrics_router)
 api_router.include_router(partners_router)
 api_router.include_router(a2a_router)
 api_router.include_router(phase_c_router)

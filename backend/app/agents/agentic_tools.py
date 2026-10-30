@@ -811,7 +811,25 @@ def submit_plan(ctx: RunContext, summary: str, files: list | None = None,
     ctx.plan = {"summary": summary, "files": files or [], "reuse_decisions": reuse_decisions or [],
                 "reconciliation": reconciliation or []}
     n = len(files or [])
-    return f"plan recorded — {n} file(s)" if n else "plan recorded"
+    # D2 — evidence grounding, ADVISORY: modify/delete entries may cite evidence
+    # ({file, line}) the agent actually READ this run (_verify_evidence consults the
+    # read-tracking ground truth, which the model cannot fake). Reported, not blocked —
+    # the deterministic gates downstream do the enforcing; this teaches the habit.
+    mutating = [e for e in (files or [])
+                if isinstance(e, dict) and e.get("action") in ("modify", "delete")]
+    grounded = 0
+    for entry in mutating:
+        ev = entry.get("evidence")
+        if ev:
+            ok, bad = _verify_evidence(ctx, ev if isinstance(ev, list) else [ev])
+            if ok and not bad:
+                grounded += 1
+    suffix = ""
+    if mutating:
+        suffix = f"; {grounded}/{len(mutating)} modify/delete entries grounded in read evidence"
+        if grounded < len(mutating):
+            suffix += " (cite evidence:[{file,line}] from files you READ for the rest)"
+    return (f"plan recorded — {n} file(s){suffix}" if n else "plan recorded")
 
 
 def scout(ctx: RunContext, question: str = "", paths: list | None = None) -> str:
@@ -2516,7 +2534,12 @@ TOOL_SCHEMAS: list[dict] = [
                                      "file the change touches end-to-end (parse → map → act → persist), not "
                                      "just one. Entries are VALIDATED: a malformed entry (wrong key names, "
                                      "missing intent, unknown action) rejects the whole submission with the "
-                                     "exact issues — fix them and re-submit the full plan."},
+                                     "exact issues — fix them and re-submit the full plan. Example entry: "
+                                     '{"path": "src/pay/RefundService.java", "action": "modify", '
+                                     '"intent": "route PARTIAL refunds through the mandate check", '
+                                     '"evidence": [{"file": "src/pay/RefundService.java", "line": 214}]} '
+                                     "— for modify/delete entries, cite evidence you READ this run; "
+                                     "grounded entries are confirmed back to you."},
             "reuse_decisions": {"type": "array", "items": {"type": "object"},
                                 "description": "for each new thing: reuse|extend|new + why"},
             "reconciliation": {"type": "array", "items": {"type": "object"},

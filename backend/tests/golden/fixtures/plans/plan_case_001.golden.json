@@ -1,0 +1,15 @@
+{
+  "note": "SYNTHETIC golden CODE PLAN (BACKLOG E2) in the live submit_plan shape — judged by the same code_plan_schema rules submit_plan enforces at the door.",
+  "files": [
+    {"path": "src/main/java/pay/TransferValidator.java", "action": "modify",
+     "intent": "accept and validate the optional purposeCode field"},
+    {"path": "src/main/java/pay/TransferMapper.java", "action": "modify",
+     "intent": "map purposeCode from the wire message into the domain object"},
+    {"path": "src/test/java/pay/TransferValidatorTest.java", "action": "create",
+     "intent": "cover valid, missing and malformed purposeCode inputs"}
+  ],
+  "tests": [
+    {"path": "src/test/java/pay/TransferValidatorTest.java", "action": "create",
+     "cases": ["valid_code_accepted", "missing_code_allowed", "malformed_code_rejected"]}
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "case_id": "case_003",
+  "doc_type": "xsd",
+  "title": "Transfer request gains a purpose code",
+  "prompt": "Add an optional purposeCode element to the transfer request so institutions can classify outbound transfers.",
+  "note": "SYNTHETIC fixture (invented message type, generic namespace) added with the B2 compile gate (BACKLOG E2) — safe to publish. The golden exercises the generator's mandated format: Summary / Diff Legend / per-file heading / complete xs:schema / Migration / Partner Impact.",
+  "domain_terms": [
+    "purposeCode",
+    "targetNamespace",
+    "minOccurs"
+  ],
+  "thresholds": {
+    "structural_min": 0.9,
+    "floor_note": "Synthetic golden scores 1.000 by construction; 0.9 leaves headroom for wording drift in future captures while still failing on a dropped section or a non-compiling schema."
+  },
+  "generation": {
+    "artifact": "xsd",
+    "model_pinned": "<unpinned — synthetic golden, not a model capture>",
+    "inputs": {
+      "instruction": "Generate the XSD changes."
+    }
+  },
+  "judge": {
+    "model_pinned": "<TODO: pin the judge model before recording semantic floors>",
+    "semantic_min": null
+  }
+}

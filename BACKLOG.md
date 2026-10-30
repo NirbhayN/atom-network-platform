@@ -106,24 +106,33 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 ## D. Planning polish
 
 1. ✅ `submit_plan` schema validation with bounce-back errors; `delete` legalized.
-2. ⬜ Few-shot example in the `submit_plan` tool description + evidence citations
-   for plan file entries (extend `_verify_evidence` beyond reuse_decisions).
-3. ⬜ Decide fate of dormant `code_planner.py` / `diff_stats_gate.py` ("not wired
-   yet") — wire as optional pre-step or delete.
-4. ⬜ Curate or auto-generate `agent_patterns.md` (repo conventions reach the code
-   agent only through this often-empty operator file).
-5. ⬜ Context starvation made loud: impact-files cap / KG fail-open to `[]` should
-   inject a visible "blast radius unavailable — verify via symbol_graph" note +
-   event (overlaps C6).
+2. ✅ `submit_plan` carries a worked example in its description, and modify/delete
+   entries may cite `evidence:[{file,line}]` — verified against the read-tracking
+   ground truth (`_verify_evidence`) and reported back ("M/N entries grounded"),
+   advisory by design (the deterministic gates do the enforcing).
+3. ✅ Dormant-planner fate decided: `code_planner.py` DELETED (zero production
+   callers — the live plan path is `submit_plan` + `code_plan_schema`);
+   `diff_stats_gate` turned out to be WIRED (orchestrator completion round) and
+   stays; `code_plan_schema` stays as the live validator.
+4. ✅ `agent_patterns.md` absence made loud: a once-per-process warning names the
+   file, the consequence (no house patterns reach the code agent) and the curation
+   recipe. Content curation itself remains operator work by design — patterns are
+   per-ecosystem facts.
+5. ✅ Covered by C6 (context-degradation block: impact graph, census, plan load).
 
 ## E. Measurement (makes everything above provable)
 
-1. ⬜ Outcome metrics aggregated from `agentic_events`: success rate,
-   rounds-to-green, verify status at completion, gates fired-vs-overridden.
-2. ⬜ Golden harness cases for ChangeAnalysis plans and XSD generation
-   (currently docgen-only, scoring-only).
-3. ⬜ Implement or delete the `CODE_TO_REVIEW` / `REVIEW_TO_BUILD` checkpoint
-   enum stubs (defined, contract-less, unwired).
+1. ✅ Outcome metrics: `app/services/agentic_metrics.py` aggregates runs + events
+   into success rate (terminal runs), final verify status per run, NEVER-BUILT
+   completions, review rounds, verify attempts (≈ rounds-to-green), per-gate fire
+   counts (the shadow evidence for hardening/deleting a gate) and loop health.
+   Exposed at `GET /api/admin/agentic/metrics` (admin-gated; ?days=&limit=).
+2. ✅ Golden cases added: `case_003` (XSD doc — rides the SAME B2 compile gate
+   production uses, so a non-compiling golden candidate fails structurally) and
+   `plans/plan_case_001` (code plan — judged by the live `code_plan_schema` +
+   planned-file coverage vs the golden; the 13-dropped-files bug class as a score).
+3. ✅ `CODE_TO_REVIEW` / `REVIEW_TO_BUILD` stubs DELETED with a pointer: Phase B
+   measurement lives in `agentic_metrics`, not the docgen checkpoint framework.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 

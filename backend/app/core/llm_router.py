@@ -69,7 +69,6 @@ _AGENT_PURPOSE: dict[str, Purpose] = {
     "xml_template_generator": Purpose.REASONING,
     "code_review":      Purpose.REASONING,
     "is_review":        Purpose.REASONING,
-    "code_planner":     Purpose.REASONING,
     "change_walkthrough": Purpose.REASONING,
     "delta_grounding":  Purpose.REASONING,   # code-back reconciliation plan amendments
     # Stuck-run helper: a quick classification of an error + a small set of recovery options.

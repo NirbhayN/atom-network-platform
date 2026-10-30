@@ -33,9 +33,10 @@ class CheckpointId(str, Enum):
     PROMPT_TO_RESEARCH = "prompt_to_research"
     CANVAS_TO_CLARIFICATION = "canvas_to_clarification"
 
-    # Phase B — third wave (needs UAT, not local)
-    CODE_TO_REVIEW = "code_to_review"
-    REVIEW_TO_BUILD = "review_to_build"
+    # Phase B checkpoints deliberately DO NOT exist here (E3): CODE_TO_REVIEW /
+    # REVIEW_TO_BUILD sat as contract-less, unwired stubs. Phase B measurement
+    # lives in app/services/agentic_metrics.py (aggregated from agentic_events),
+    # not in this docgen checkpoint framework.
 
     # Phase C / A2A — third wave
     A2A_OUTBOUND_PREFLIGHT = "a2a_outbound_preflight"

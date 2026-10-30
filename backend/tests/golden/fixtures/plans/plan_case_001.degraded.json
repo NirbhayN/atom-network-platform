@@ -1,0 +1,9 @@
+{
+  "note": "Degraded twin: key drift (file/action typo) plus a silently dropped deliverable — the plan_files 13-dropped-files bug class.",
+  "files": [
+    {"file": "src/main/java/pay/TransferValidator.java", "action": "edit",
+     "intent": "accept and validate the optional purposeCode field"},
+    {"path": "src/main/java/pay/TransferMapper.java", "action": "modify",
+     "intent": "map purposeCode from the wire message into the domain object"}
+  ]
+}

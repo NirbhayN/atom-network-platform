@@ -1,18 +1,13 @@
 # Copyright 2026 The ATOM Authors
 # SPDX-License-Identifier: MIT
 
-"""Tests for the code plan schema + one-shot planner.
+"""Tests for the code plan schema (the live validator behind submit_plan).
 
-Pure — no real LLM. `call_llm` is monkeypatched. All validator tests are
-pure-dict-in, pure-dict-out.
+Pure-dict-in, pure-dict-out — no LLM.
 """
 from __future__ import annotations
 
-import json
-
-import pytest
-
-from app.agents import code_plan_schema, code_planner
+from app.agents import code_plan_schema
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -177,105 +172,6 @@ def test_test_empty_cases_fails():
     assert any("`cases` must be a non-empty list" in m for m in report["issues"])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# generate_plan() — mocked LLM
-# ──────────────────────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_generator_returns_parsed_plan(monkeypatch):
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        return json.dumps(_VALID_PLAN)
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    out = await code_planner.generate_plan("tech spec text here")
-    assert "files" in out
-    assert len(out["files"]) == 2
-    report = code_plan_schema.validate(out)
-    assert report["schema_valid"] is True
-
-
-@pytest.mark.asyncio
-async def test_generator_drops_unknown_top_level_keys(monkeypatch):
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        payload = dict(_VALID_PLAN)
-        payload["hallucinated_field"] = "should be dropped"
-        return json.dumps(payload)
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    out = await code_planner.generate_plan("tech spec")
-    assert "hallucinated_field" not in out
-    assert "files" in out
-
-
-@pytest.mark.asyncio
-async def test_generator_llm_exception_returns_empty(monkeypatch):
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        raise RuntimeError("LLM down")
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    assert await code_planner.generate_plan("tech spec") == {}
-
-
-@pytest.mark.asyncio
-async def test_generator_non_json_returns_empty(monkeypatch):
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        return "Here's a helpful plan: create rate limiter then add tests."
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    assert await code_planner.generate_plan("tech spec") == {}
-
-
-@pytest.mark.asyncio
-async def test_generator_empty_input_short_circuits(monkeypatch):
-    called = {"n": 0}
-
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        called["n"] += 1
-        return "{}"
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    assert await code_planner.generate_plan("") == {}
-    assert await code_planner.generate_plan("   ") == {}
-    assert called["n"] == 0
-
-
-@pytest.mark.asyncio
-async def test_generator_brd_included_in_prompt(monkeypatch):
-    """When BRD is provided, it should appear in the user payload."""
-    captured = {}
-
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        captured["user"] = messages[-1]["content"]
-        return json.dumps(_VALID_PLAN)
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    await code_planner.generate_plan(
-        tech_spec="tech spec body",
-        brd="approved BRD context here",
-    )
-    assert "tech spec body" in captured["user"]
-    assert "approved BRD context here" in captured["user"]
-
-
-@pytest.mark.asyncio
-async def test_generator_brd_truncated_when_long(monkeypatch):
-    """BRDs > 4000 chars get truncated with an ellipsis marker."""
-    captured = {}
-
-    async def fake_call_llm(system, messages, max_tokens=3000, **kwargs):
-        captured["user"] = messages[-1]["content"]
-        return json.dumps(_VALID_PLAN)
-
-    monkeypatch.setattr("app.core.llm.call_llm", fake_call_llm)
-
-    long_brd = "x" * 5000
-    await code_planner.generate_plan("tech spec", brd=long_brd)
-    assert "..." in captured["user"]
-    # The full 5000-char BRD shouldn't appear verbatim
-    assert "x" * 5000 not in captured["user"]
+# The generate_plan() tests were removed with code_planner.py (BACKLOG D3): the
+# one-shot planner had no production caller — the LIVE plan path is submit_plan,
+# which validates against this same code_plan_schema at the door.

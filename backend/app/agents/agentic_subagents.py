@@ -263,6 +263,9 @@ _CODE_PREFACE = (
 )
 
 
+_PATTERNS_WARNED = False
+
+
 def _patterns_clause() -> str:
     """D1 — golden implementation patterns, injected as NORMATIVE for the code agent. Read at
     call time from ``<knowledge_base_dir>/agent_patterns.md`` (operator-curated; per-deployment)
@@ -275,6 +278,17 @@ def _patterns_clause() -> str:
         p = Path(settings.knowledge_base_dir) / "agent_patterns.md"
         text = p.read_text(encoding="utf-8").strip() if p.is_file() else ""
         if not text:
+            # D4 — absence made LOUD (once per process): an empty file means house
+            # implementation patterns are NOT reaching the code agent, and the
+            # Test-8 class of re-invented-pattern bugs stays open. Curating it is
+            # operator work: one "## <integration point>" section per golden
+            # pattern, each with a short canonical snippet from the real codebase.
+            global _PATTERNS_WARNED
+            if not _PATTERNS_WARNED:
+                _PATTERNS_WARNED = True
+                logger.warning("agent_patterns.md is missing/empty at %s — no house patterns "
+                               "reach the code agent; curate it (one section per integration "
+                               "point, canonical snippet each)", p)
             return ""
         return ("\n\nGOLDEN IMPLEMENTATION PATTERNS (NORMATIVE — for any integration point these "
                 "cover, follow the pattern EXACTLY; a deviation requires an explicit justification "
