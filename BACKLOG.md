@@ -28,15 +28,21 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
    discards the entry, external changes re-serve content (hash check), compaction
    clears the registry so a stub never points at evicted content, and ranged
    reads are always served (the refetch escape hatch).
-6. ⬜ Retire legacy `code_change.py` (pre-stuffs top-k RAG, 20KB KEEP/SKIP doc
-   compression that can drop regulatory sections — the agentic path fixed this,
-   the console path didn't).
-7. ⬜ Seed-budget demotion: when an intent-matched doc section is demoted to a
-   `read_doc` pointer, force the follow-up read (or list demoted headings loudly).
-8. ⬜ Capped search results (SWE-agent style): `grep`/`code_search_semantic` return
-   "N matches, top 20 — narrow the query" instead of everything.
-9. ⬜ Aider-style ranked repo map: upgrade `module_notes` from flat name+summary to
-   a reference-ranked symbol skeleton within the same 8KB budget.
+6. ✅ Legacy `code_change.py` defused in place (the flow stays — the Phase-B console
+   UI still drives /phase-b): the compressor's SKIP list literally contained
+   "compliance"/"regulatory" — the exact dropped-section bug, living on. Now a
+   MANDATORY tier (the agentic seed regex) outranks both lists, dropped sections
+   are NAMED in the marker, and the path logs a once-per-process deprecation
+   pointing at the agentic runs. Full deletion waits on the console UI migration.
+7. ✅ Seed-budget demotion is a DIRECTIVE: demoted compliance/intent sections are
+   listed under "you MUST read_doc EACH before you finish; a requirement you never
+   read is not implemented".
+8. ✅ Verified already present: `grep` (cap + "N more matches — narrow"), `glob`
+   (500 + same note), `code_search_semantic` (k≤20, 240-char snippets). No code
+   change needed — the audit item was stale.
+9. ✅ Impact-ranked module index: blast-radius modules float to the top of the
+   module index with a "⚑ in this change's blast radius" marker, same 8KB budget
+   (full reference-ranked symbol skeleton deferred — needs an index-time pass).
 
 ## B. XSD generation (biggest unclaimed accuracy jump)
 

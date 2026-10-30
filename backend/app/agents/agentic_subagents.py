@@ -499,12 +499,38 @@ def _sections_block(title: str, sections: dict) -> str:
     return f"## {title}\n" + "\n\n".join(f"### {h}\n{b}" for h, b in sections.items())
 
 
+_MODULE_LINE_RE = re.compile(r"^\s*-\s+(\S+)")
+
+
+def _rank_module_lines(notes: str, impact_files: list[str]) -> str:
+    """A9 — Aider-style ranking inside the same budget: module lines whose path
+    appears in the blast radius float to the top with a ⚑ marker, so the agent's
+    first glance lands on the modules this change actually touches. Original order
+    is kept within each group; the trailing '+N more' pointer stays last."""
+    if not impact_files or not notes:
+        return notes
+    lines = notes.splitlines()
+    hot: list[str] = []
+    rest: list[str] = []
+    for ln in lines:
+        m = _MODULE_LINE_RE.match(ln)
+        mod = (m.group(1) if m else "").strip()
+        if (mod and mod != "." and len(mod) > 2
+                and any(mod in f for f in impact_files)):
+            hot.append(ln.rstrip() + "   ⚑ in this change's blast radius")
+        else:
+            rest.append(ln)
+    return "\n".join(hot + rest) if hot else notes
+
+
 def _module_block(ctx: ContextPack) -> str:
     if not ctx.module_notes:
         return ""
+    impact = getattr(ctx, "impact_files", None) or []
     return ("## Module index — names only; pull a module's full context with "
             "module_context(module=…)\n" + "\n\n".join(
-                f"### repo {rid}\n{notes}" for rid, notes in ctx.module_notes.items()))
+                f"### repo {rid}\n{_rank_module_lines(notes, impact)}"
+                for rid, notes in ctx.module_notes.items()))
 
 
 def _doc_outline(label: str, sections: dict) -> str:
@@ -546,9 +572,15 @@ def _seed_sections(ctx: ContextPack) -> str:
         out.append(block)
         used += len(block)
     if skipped:
-        out.append("(seed budget reached — these matched but are NOT shown; consult each via "
-                   "read_doc(heading=…) before finishing: " + "; ".join(skipped[:12])
-                   + (" …" if len(skipped) > 12 else "") + ")")
+        # A7 — demotion is a DIRECTIVE, not a hint: these sections matched compliance
+        # terms or the change intent and only lost a token-budget race. An unread one
+        # is unfinished work, and the finish-line checks treat it that way.
+        out.append("⚠ SEED BUDGET REACHED — the following sections MATCHED this change "
+                   "(compliance or intent) but are NOT shown. You MUST read_doc(heading=…) "
+                   "EACH of them before you finish; a requirement you never read is not "
+                   "implemented, and 'it wasn't shown to me' is not a defence:\n- "
+                   + "\n- ".join(skipped[:12])
+                   + ("\n- …" if len(skipped) > 12 else ""))
     return "\n\n".join(out)
 
 

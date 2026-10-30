@@ -405,3 +405,19 @@ def test_degraded_grounding_is_rendered_loudly():
     assert "CONTEXT DEGRADED" in text and "symbol graph unavailable" in text
     clean = ContextPack(selected_repo_ids=["r1"])
     assert "CONTEXT DEGRADED" not in str(build_system_segments(clean, "preface"))
+
+
+def test_impact_modules_float_to_the_top_with_marker():
+    # A9 — blast-radius modules lead the index; order preserved otherwise.
+    from app.agents.agentic_subagents import _rank_module_lines
+    notes = ("- common-utils — shared helpers\n"
+             "- payment-core — payment flows\n"
+             "  - payment-core/refunds — refund handling\n"
+             "- reporting — exports")
+    ranked = _rank_module_lines(notes, ["payment-core/refunds/src/RefundSvc.java"])
+    lines = ranked.splitlines()
+    assert lines[0].startswith("- payment-core ") and "⚑" in lines[0]
+    assert "⚑" in lines[1] and "refunds" in lines[1]
+    assert lines[2].startswith("- common-utils") and "⚑" not in lines[2]
+    # no impact info → untouched
+    assert _rank_module_lines(notes, []) == notes

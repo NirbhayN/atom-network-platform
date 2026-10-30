@@ -434,6 +434,14 @@ _DOC_KEEP_KEYWORDS = (
     "tech spec", "technical spec",
     "xsd",
 )
+# MANDATORY tier (A6): mirrors the agentic path's seed regex (_SEED_RE in
+# agentic_subagents) — compliance/regulatory/error-code/security/mandate/validation
+# sections are implementable CONSTRAINTS, and this compressor's old SKIP list
+# ("compliance", "regulatory") silently dropped them: the exact
+# dropped-regulatory-section bug the agentic context assembler was built to fix,
+# living on in the legacy path. Mandatory beats both KEEP and SKIP.
+_DOC_MANDATORY_RE = re.compile(r"regulat|complian|error[\s-]?code|security|mandat|validation", re.I)
+
 # Generic across every domain: these name sections that are narrative or
 # governance framing rather than implementable behaviour.
 _DOC_SKIP_KEYWORDS_BASE = (
@@ -441,7 +449,6 @@ _DOC_SKIP_KEYWORDS_BASE = (
     "background", "current process", "current state",
     "out of scope", "future enhancement",
     "risk", "fraud", "misuse",
-    "compliance", "regulatory",
     "sla matrix", "operational readiness", "monitoring", "alert",
     "runbook", "capacity",
     "assumption", "dependency", "constraint",
@@ -512,6 +519,8 @@ def _compress_doc_for_code_change(
 
     def _classify(heading: str) -> str:
         h = heading.lower()
+        if _DOC_MANDATORY_RE.search(h):
+            return "KEEP"                       # constraints outrank every list (A6)
         if any(kw in h for kw in _DOC_KEEP_KEYWORDS):
             return "KEEP"
         if any(kw in h for kw in skip_keywords):
@@ -552,17 +561,19 @@ def _compress_doc_for_code_change(
             # Don't truncate UNKNOWN sections mid-content; just stop.
             break
 
-    skipped_count = sum(1 for _, _, c in classified if c == "SKIP")
-    omitted_count = sum(
-        1 for h, _, c in classified
-        if c == "UNKNOWN" and f"## {h}\n" not in "\n".join(out_parts[1:])
-    )
+    skipped = [h for h, _, c in classified if c == "SKIP"]
+    omitted = [h for h, _, c in classified
+               if c == "UNKNOWN" and f"## {h}\n" not in "\n".join(out_parts[1:])]
 
-    if skipped_count or omitted_count or truncated_in_section:
+    if skipped or omitted or truncated_in_section:
+        def _names(hs):   # name the loss — a bare count reads as "nothing important"
+            return "; ".join(hs[:8]) + (" …" if len(hs) > 8 else "")
         out_parts.append(
             f"\n... [{doc_label} compressed for prompt budget: "
-            f"{skipped_count} non-code-relevant section(s) dropped"
-            + (f", {omitted_count} other section(s) omitted to fit budget" if omitted_count else "")
+            + (f"{len(skipped)} non-code-relevant section(s) dropped ({_names(skipped)})"
+               if skipped else "")
+            + (f"{'; ' if skipped else ''}{len(omitted)} section(s) omitted to fit budget "
+               f"({_names(omitted)})" if omitted else "")
             + (", last kept section truncated mid-content" if truncated_in_section else "")
             + "; full doc available via the docgen API]"
         )
@@ -840,6 +851,9 @@ def _build_system_prompt(
     return system_prompt, path_to_repo, repo_label_to_id, primary_repo_id, doc_context_block
 
 
+_LEGACY_PATH_WARNED = False
+
+
 async def stream_code_change_turn(
     db: Session,
     change_request_id: str,
@@ -866,6 +880,16 @@ async def stream_code_change_turn(
     Yields:
         str — text tokens from the LLM stream.
     """
+    # A6 — this is the LEGACY whole-file-rewrite path with materially weaker grounding
+    # than the agentic runs (pre-stuffed top-k RAG + budgeted doc compression vs the
+    # pull-based tool loop). It stays because the Phase-B console UI still drives it,
+    # but new work belongs on the agentic pipeline. Said once per process.
+    global _LEGACY_PATH_WARNED
+    if not _LEGACY_PATH_WARNED:
+        _LEGACY_PATH_WARNED = True
+        logger.warning("legacy code_change path in use (change=%s) — superseded by the agentic "
+                       "runs (/api/agentic): weaker grounding by construction; prefer the "
+                       "agentic pipeline for new work", change_request_id)
     system_prompt, _, _, _, doc_context_block = _build_system_prompt(
         db, change_request_id, tech_spec, brd,
         phase_b_run_id=phase_b_run_id,
