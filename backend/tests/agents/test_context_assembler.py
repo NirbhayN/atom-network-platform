@@ -112,3 +112,46 @@ def test_impact_files_age_backend_still_routes_to_analyze_impact(monkeypatch):
                         lambda db, change_description: _Rep())
     files = _impact_files(None, ["add a reasonCode field to RefundRequest", None, None])
     assert files == ["network-parent/api-gateway/A.java", "psp/B.java"]
+
+
+# ── A9 (full): reference-ranked module index from depends_on edges ──────────────────
+
+from types import SimpleNamespace as _NS
+
+
+class _FakeQuery:
+    def __init__(self, rows): self._rows = rows
+    def filter(self, *a, **k): return self
+    def order_by(self, *a): return self
+    def limit(self, n): return self
+    def all(self): return self._rows
+
+
+def _mod(path, summary, deps=None, depth=0):
+    return _NS(module_path=path, depth=depth, summary=summary, depends_on=deps or [])
+
+
+def test_module_index_annotates_inbound_references():
+    from app.agents import context_assembler as CA
+    rows = [_mod("app-core", "shared types"),
+            _mod("payments", "payment flows", deps=["app-core"]),
+            _mod("reporting", "exports", deps=["app-core"])]
+    db = _NS(query=lambda model: _FakeQuery(rows))
+    out = CA.module_notes(db, ["r1"], None)["r1"]
+    first = out.splitlines()[0]
+    assert first.startswith("- app-core") and "← 2 module(s) depend on this" in first
+    assert "← " not in out.splitlines()[1], "leaves carry no annotation"
+
+
+def test_module_index_budget_drops_least_referenced_first(monkeypatch):
+    from app.agents import context_assembler as CA
+    monkeypatch.setattr(CA, "_NOTES_CAP", 200)
+    rows = [_mod("hub", "core"),
+            _mod("leaf-a", "a" * 80, deps=["hub"]),
+            _mod("leaf-b", "b" * 80),
+            _mod("leaf-c", "c" * 80)]
+    db = _NS(query=lambda model: _FakeQuery(rows))
+    out = CA.module_notes(db, ["r1"], None)["r1"]
+    assert "hub" in out and "← 1 module(s)" in out, "the referenced hub must survive the budget"
+    assert "least-referenced dropped" in out, "drops are named, not silent"
+    assert out.splitlines()[0].startswith("- hub"), "render keeps SQL (depth, path) order"

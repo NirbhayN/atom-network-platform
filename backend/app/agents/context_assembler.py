@@ -270,18 +270,50 @@ def module_notes(db, selected_repo_ids: list[str], run_id: str | None = None) ->
             .all()
         )
         if rows:
-            # Cap on WHOLE-LINE boundaries — a bare [:_NOTES_CAP] slice cut a module line
-            # mid-word ("DbSyncProperti…"). Drop trailing modules with a pointer instead.
-            lines: list[str] = []
-            used = 0
+            # A9 — reference-ranked map, honest data: inbound counts come from the
+            # index-time ``depends_on`` edges (what other modules actually declare),
+            # never guessed. Load-bearing modules are annotated, and when the 8KB
+            # budget forces drops, the LEAST-referenced modules go first instead of
+            # whatever happened to sort last. Rendering keeps (depth, path) order so
+            # the hierarchy still reads as a tree. Cap on WHOLE-LINE boundaries — a
+            # bare [:_NOTES_CAP] slice cut a module line mid-word ("DbSyncProperti…").
+            by_path = {r.module_path or "": r for r in rows}
+            by_base = {}
             for r in rows:
+                base = (r.module_path or "").rsplit("/", 1)[-1]
+                by_base.setdefault(base, []).append(r)
+            inbound: dict[int, int] = {}
+            for r in rows:
+                # getattr — tolerate row shapes without the column (legacy indexes,
+                # projected query results): they simply rank as unreferenced.
+                for dep in (getattr(r, "depends_on", None) or []):
+                    d = str(dep).strip()
+                    if not d:
+                        continue
+                    target = by_path.get(d)
+                    if target is None:
+                        cands = by_base.get(d.rsplit("/", 1)[-1]) or []
+                        target = cands[0] if len(cands) == 1 else None   # ambiguous → don't guess
+                    if target is not None and target is not r:
+                        inbound[id(target)] = inbound.get(id(target), 0) + 1
+            order = {id(r): i for i, r in enumerate(rows)}          # SQL gave (depth, path)
+            line_of: dict[int, str] = {}
+            used = 0
+            dropped = 0
+            for r in sorted(rows, key=lambda r: (-inbound.get(id(r), 0), order[id(r)])):
                 ln = _module_index_line(r)
+                refs = inbound.get(id(r), 0)
+                if refs:
+                    ln += f"   ← {refs} module(s) depend on this"
                 if used + len(ln) + 1 > _NOTES_CAP:
-                    lines.append(f"… (+{len(rows) - len(lines)} more modules — "
-                                 "call module_context to list all)")
-                    break
-                lines.append(ln)
+                    dropped += 1
+                    continue
+                line_of[id(r)] = ln
                 used += len(ln) + 1
+            lines = [line_of[id(r)] for r in rows if id(r) in line_of]
+            if dropped:
+                lines.append(f"… (+{dropped} more modules — least-referenced dropped "
+                             "for budget; call module_context to list all)")
             out[rid] = "\n".join(lines)
             continue
         if run_id:

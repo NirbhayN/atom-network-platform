@@ -1,0 +1,36 @@
+<!--
+  GOLDEN IMPLEMENTATION PATTERNS — operator-curated (BACKLOG D4).
+
+  Copy this file into your deployment.s `knowledge_base_dir` as `agent_patterns.md` (the backend setting
+  `knowledge_base_dir`) and replace the examples with YOUR ecosystem's house
+  patterns. The code agent injects the file's content as NORMATIVE on every
+  code round: for any integration point a section covers, the agent must follow
+  the pattern exactly or justify why it cannot.
+
+  Why this exists: without it the agent re-invents dispatch/persist/validation
+  wiring from first principles each round — plausible each time, different each
+  time (the Test-8 five-round bug class). One short canonical snippet per
+  integration point ends that.
+
+  Rules of thumb:
+  - One `## <integration point>` section per pattern, with a SHORT canonical
+    snippet copied from the real codebase (10–30 lines beats a page).
+  - Patterns are per-ecosystem FACTS, not style preferences — only include what
+    a reviewer would reject a deviation from.
+  - The whole file is injected within a ~6000-char budget; keep it tight.
+  - This .example file is NEVER read by the agent — only `agent_patterns.md` is.
+-->
+
+## Example — message handler registration
+```java
+// New inbound message types register in <YourDispatcherRegistry>, never via a
+// hand-rolled if/else chain in the controller:
+registry.register(MsgType.REQ_TRANSFER, new ReqTransferHandler(deps…));
+```
+
+## Example — persisting a new transaction state
+```java
+// State transitions go through <YourTxnStateService>.transition(…) — it owns
+// the audit row + idempotency key; a direct repository.save() skips both:
+txnStateService.transition(txn, TxnState.VALIDATED, auditCtx);
+```

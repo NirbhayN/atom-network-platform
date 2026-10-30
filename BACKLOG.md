@@ -40,9 +40,21 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 8. ✅ Verified already present: `grep` (cap + "N more matches — narrow"), `glob`
    (500 + same note), `code_search_semantic` (k≤20, 240-char snippets). No code
    change needed — the audit item was stale.
-9. ✅ Impact-ranked module index: blast-radius modules float to the top of the
-   module index with a "⚑ in this change's blast radius" marker, same 8KB budget
-   (full reference-ranked symbol skeleton deferred — needs an index-time pass).
+9. ✅ Reference-ranked module index, both halves: blast-radius modules float to
+   the top with a "⚑" marker at render time, AND inbound-dependency counts from
+   the index-time `depends_on` edges annotate load-bearing modules ("← N
+   module(s) depend on this") with budget drops taking the LEAST-referenced
+   modules first (named, never silent). Honest data throughout — no guessed
+   ranks.
+10. ✅ Residuals closed: identical ranged re-reads are stubbed (any different
+    range serves — the refetch escape hatch stays open; external changes and
+    edits invalidate; compaction clears). Console-UI migration VERIFIED already
+    done: PhaseB.jsx drives Code/Review/Git through the agentic run for
+    admin/tech_lead ("no legacy Generate Code CTA"); the legacy WS remains a
+    deliberate role-gated fallback with a backend deprecation warning.
+    Operator templates shipped: `knowledge_base/agent_patterns.md.example`
+    (curation recipe + format) and `backend/.env.example` documents
+    AGENTIC_REVIEWER_MODEL + keep-unset guidance for the retired skip lists.
 
 ## B. XSD generation (biggest unclaimed accuracy jump)
 

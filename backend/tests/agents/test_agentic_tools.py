@@ -650,3 +650,22 @@ def test_edit_preexisting_facet_defect_stays_advisory(ws):
     T.read_file(ctx, RID, "src/legacy.xsd")
     out = T.edit_file(ctx, RID, "src/legacy.xsd", old_string='name="Code"', new_string='name="Kode"')
     assert out.startswith("edited ") and "facet check" in out      # advisory note, not a block
+
+
+def test_identical_ranged_reread_is_stubbed_but_any_variant_serves(ws):
+    ctx = _ctx()
+    assert "class A" in T.read_file(ctx, RID, "src/A.java", start_line=1, end_line=2)
+    again = T.read_file(ctx, RID, "src/A.java", start_line=1, end_line=2)
+    assert "UNCHANGED since you last read this exact range" in again
+    # ANY different range serves — the post-compaction refetch escape hatch.
+    assert "class A" in T.read_file(ctx, RID, "src/A.java", start_line=1, end_line=3)
+    ctx.fresh_ranges.clear()                      # what the runtime does on eviction
+    assert "class A" in T.read_file(ctx, RID, "src/A.java", start_line=1, end_line=2)
+
+
+def test_external_change_invalidates_ranged_freshness(ws):
+    ctx = _ctx()
+    T.read_file(ctx, RID, "src/A.java", start_line=2, end_line=2)
+    (ws / "src" / "A.java").write_text("class A {\n    int x = 42;\n}\n")
+    out = T.read_file(ctx, RID, "src/A.java", start_line=2, end_line=2)
+    assert "int x = 42;" in out, "a stale 'unchanged' stub about rewritten content"

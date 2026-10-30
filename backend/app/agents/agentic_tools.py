@@ -111,6 +111,11 @@ class RunContext:
     # compaction evicts tool outputs (a stub must never point at evicted content).
     # Distinct from `full_reads`, which is the append-only evidence record.
     fresh_reads: set[tuple[str, str]] = field(default_factory=set)
+    # Companion registry for RANGED reads: {(repo, path): {(lo, hi), …}} of ranges whose
+    # text is still verbatim in the conversation. An IDENTICAL repeat of a served range
+    # on an unchanged file is pure duplication → stubbed; ANY different range is always
+    # served (the refetch escape hatch stays open). Invalidated with fresh_reads.
+    fresh_ranges: dict[tuple[str, str], set[tuple[int, int]]] = field(default_factory=dict)
     # Full outputs of truncated run_command calls, keyed "out<N>" — retrievable (paged)
     # via the read_output tool instead of forcing an expensive/non-reproducible re-run.
     command_outputs: dict[str, str] = field(default_factory=dict)
@@ -305,6 +310,12 @@ def read_file(ctx: RunContext, repo_id: str | None = None, path: str | None = No
                 "re-sent; it is already in your context above. If that earlier read is no "
                 "longer visible (compacted away), call read_file with start_line/end_line "
                 "to refetch the part you need.]")
+    # Content changed on disk since the last read → every freshness claim for this
+    # file dies NOW, before the hash below is overwritten (otherwise a stale ranged
+    # stub could assert "unchanged" about text the model never saw).
+    if ctx.read_hashes.get(key) not in (None, digest):
+        ctx.fresh_reads.discard(key)
+        ctx.fresh_ranges.pop(key, None)
     ctx.read_files.add(key)
     ctx.read_hashes[key] = digest                       # full-file hash even for a ranged read
 
@@ -313,10 +324,18 @@ def read_file(ctx: RunContext, repo_id: str | None = None, path: str | None = No
         lines = text.splitlines()
         lo = max((start_line or 1) - 1, 0)
         hi = end_line or len(lines)
+        span = (lo + 1, min(hi, len(lines)))
+        # Identical repeat of a range already served from this exact content → stub
+        # (same discipline as full reads). Any DIFFERENT range serves — that is the
+        # refetch escape hatch after compaction, and it must never be closed.
+        if span in ctx.fresh_ranges.get(key, set()):
+            return (f"[{path} lines {span[0]}-{span[1]} UNCHANGED since you last read this exact "
+                    "range — not re-sent. Adjust the range (or read the full file) to refetch.]")
         body = "\n".join(lines[lo:hi])
         # Granularity record: this read covers ONLY [lo+1, hi] — evidence citing lines
         # outside every read range is not verified by it (_verify_evidence).
-        ctx.read_ranges.setdefault((repo_id, path), []).append((lo + 1, min(hi, len(lines))))
+        ctx.read_ranges.setdefault((repo_id, path), []).append(span)
+        ctx.fresh_ranges.setdefault(key, set()).add(span)
     else:
         ctx.full_reads.add(key)
         ctx.fresh_reads.add(key)
@@ -726,6 +745,7 @@ def edit_file(ctx: RunContext, repo_id: str, path: str,
     # The full copy sitting in the conversation is now stale — a later full read must
     # return the real post-edit content, not the unchanged-read stub.
     ctx.fresh_reads.discard((repo_id, path))
+    ctx.fresh_ranges.pop((repo_id, path), None)
     op = "add" if (repo_id, path) in ctx.file_ops and ctx.file_ops[(repo_id, path)].op == "add" else "modify"
     ctx.file_ops[(repo_id, path)] = FileOp(op, repo_id, path, new_content, _sha256(new_content))
     return (f"edited {path} (match level {level})\n{_edit_echo(new_content, new_string)}"

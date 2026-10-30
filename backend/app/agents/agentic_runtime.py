@@ -1021,6 +1021,7 @@ async def run_agent_loop(
                 _summarized = await _pin_progress_summary(messages, system, model, agent_name, None)
                 _reclaimed = _compact_messages(messages, settings.agentic_compact_keep_recent_turns)
                 ctx.fresh_reads.clear()   # evicted reads must not be served as "unchanged" stubs
+                ctx.fresh_ranges.clear()
                 if not _summarized:
                     _note_unsummarized_eviction(messages)
                 _pin_ground_truth(messages, ctx)
@@ -1056,6 +1057,7 @@ async def run_agent_loop(
             _summarized = await _pin_progress_summary(messages, system, model, agent_name, None)
             _reclaimed = _compact_messages(messages, keep_tail=2)
             ctx.fresh_reads.clear()       # evicted reads must not be served as "unchanged" stubs
+            ctx.fresh_ranges.clear()
             _pin_ground_truth(messages, ctx)
             if not _summarized:
                 _note_unsummarized_eviction(messages)
@@ -1195,6 +1197,7 @@ async def run_agent_loop(
             # 2) Evict the bulky, reconstructable tool outputs.
             _reclaimed = _compact_messages(messages, settings.agentic_compact_keep_recent_turns)
             ctx.fresh_reads.clear()       # evicted reads must not be served as "unchanged" stubs
+            ctx.fresh_ranges.clear()
             # 3) Re-inject the DETERMINISTIC run state (edited files, plan) — the summary
             #    above is an LLM's recollection; this block is the harness's record.
             _pin_ground_truth(messages, ctx)
