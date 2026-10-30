@@ -159,10 +159,41 @@ def _skip_patterns() -> list:
 
 
 # Java release declared in a pom: <maven.compiler.release>, .target, .source,
-# <java.version>, or a bare <release> inside the compiler plugin. "1.8" → 8.
+# <java.version>, or a bare <release> inside the compiler plugin. The VALUE may be a
+# literal in either scheme — legacy "1.8" and modern "8" are the SAME major, never two
+# different ones — or a ${property} reference resolved against the pom chain's
+# <properties> (module overrides parent, matching Maven's effective-pom rules).
 _JAVA_REL_TAGS = re.compile(
     r"<(?:maven\.compiler\.(?:release|target|source)|java\.version|release)>\s*"
-    r"(?:1\.)?(\d+)\s*</", re.I)
+    r"([^<]+?)\s*</", re.I)
+_JAVA_MAJOR_RE = re.compile(r"^(?:1\.)?(\d+)")
+_PROP_REF_RE = re.compile(r"^\$\{([^}]+)\}$")
+_PROPS_BLOCK_RE = re.compile(r"<properties>(.*?)</properties>", re.I | re.S)
+_PROP_ENTRY_RE = re.compile(r"<([A-Za-z0-9_.\-]+)>\s*([^<]*?)\s*</\1>")
+
+
+def _java_major_of(value: str, props: dict | None = None) -> int | None:
+    """Normalise a declared Java version to its major: "8" → 8, legacy "1.8" → 8,
+    "17" → 17, "1.8.0_292" → 8, "${java.version}" → resolved via ``props``. A bare
+    "1" is never a real release in pom land → undeclared, and a value that is
+    neither numeric nor a resolvable property is undeclared too (don't guess)."""
+    v = (value or "").strip()
+    for _ in range(4):                     # bounded ${a} → ${b} chains; cycle-safe
+        ref = _PROP_REF_RE.match(v)
+        if not ref or props is None:
+            break
+        v = (props.get(ref.group(1)) or "").strip()
+    m = _JAVA_MAJOR_RE.match(v)
+    if not m:
+        return None
+    major = int(m.group(1))
+    return major if major > 1 else None
+
+
+def _pom_properties(text: str) -> dict:
+    """The pom's <properties> as a flat dict (regex-level; ample for version props)."""
+    m = _PROPS_BLOCK_RE.search(text or "")
+    return dict(_PROP_ENTRY_RE.findall(m.group(1))) if m else {}
 
 
 def detect_required_java(repo_dir: Path, *, pom_cap: int = 200) -> int | None:
@@ -172,6 +203,13 @@ def detect_required_java(repo_dir: Path, *, pom_cap: int = 200) -> int | None:
     best: int | None = None
     scanned = 0
     try:
+        root_props: dict = {}
+        root = repo_dir / "pom.xml"
+        if root.is_file():
+            try:
+                root_props = _pom_properties(root.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
         for pom in repo_dir.rglob("pom.xml"):
             if scanned >= pom_cap:
                 break
@@ -180,12 +218,141 @@ def detect_required_java(repo_dir: Path, *, pom_cap: int = 200) -> int | None:
                 text = pom.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            props = {**root_props, **_pom_properties(text)}   # own pom wins
             for m in _JAVA_REL_TAGS.finditer(text):
-                v = int(m.group(1))
-                best = v if best is None else max(best, v)
+                v = _java_major_of(m.group(1), props)
+                if v is not None:
+                    best = v if best is None else max(best, v)
     except Exception:  # noqa: BLE001 — preflight hint only
         return best
     return best
+
+
+def _pom_chain(repo_dir: Path, module_dir: str | None) -> list[Path]:
+    """pom.xml files from the module dir UP to the repo root, nearest first."""
+    repo_dir = repo_dir.resolve()
+    d = repo_dir if module_dir in (None, "", ".") else (repo_dir / module_dir).resolve()
+    chain: list[Path] = []
+    while True:
+        pom = d / "pom.xml"
+        if pom.is_file():
+            chain.append(pom)
+        if d == repo_dir or d == d.parent:
+            return chain
+        d = d.parent
+
+
+def detect_module_java(repo_dir: Path, module_dir: str | None) -> int | None:
+    """The Java major THIS module's effective pom declares — the per-module answer
+    ``detect_required_java`` (repo-wide max) cannot give for a mixed-major repo.
+    Nearest declaration wins (the module's own pom over its parents), and a parent's
+    ``<source>${java.version}</source>`` honours the module's property override —
+    so a legacy module declaring ``1.8`` and a sibling declaring ``17`` each resolve
+    to their OWN major. Best-effort; None = undeclared (fall back to the repo scan)."""
+    try:
+        texts: list[str] = []
+        props: dict = {}
+        for pom in _pom_chain(repo_dir, module_dir):   # nearest first
+            try:
+                text = pom.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            texts.append(text)
+            for k, v in _pom_properties(text).items():
+                props.setdefault(k, v)                 # child property values win
+        for text in texts:                             # nearest declaration wins
+            majors = [v for m in _JAVA_REL_TAGS.finditer(text)
+                      if (v := _java_major_of(m.group(1), props)) is not None]
+            if majors:
+                return max(majors)   # within one pom: source vs target → the higher
+        return None
+    except Exception:  # noqa: BLE001 — preflight hint only
+        return None
+
+
+# A failed reactor build is retried per-module with the module's OWN JDK (below) for
+# at most this many failing modules — more than this means the breakage is systemic,
+# not a per-module toolchain mismatch.
+_JDK_RETRY_CAP = 4
+
+
+def _failing_module_dirs(repo_dir: Path, step: VerificationStep, diagnostics: list) -> set[str]:
+    """The module dir(s) a failed build step's diagnostics point at. A build-from-dir
+    step IS its module; a reactor step is resolved from the ``path:line: message``
+    diagnostic paths (nearest ancestor pom). The repo root ('.') is never returned
+    for a reactor step — rebuilding the whole reactor is not a targeted retry."""
+    if step.subdir and step.subdir not in (".", ""):
+        return {step.subdir}
+    dirs: set[str] = set()
+    for line in diagnostics or []:
+        p = (line or "").split(":", 1)[0].strip()
+        if not p or " " in p or "/" not in p:     # module labels / prose, not source paths
+            continue
+        try:
+            pp = Path(p)
+            rel = (pp.resolve().relative_to(repo_dir.resolve()).as_posix()
+                   if pp.is_absolute() else pp.as_posix())
+        except (ValueError, OSError):
+            continue                               # outside the clone
+        md = path_to_module_dir(repo_dir, rel)
+        if md and md != ".":
+            dirs.add(md)
+    return dirs
+
+
+def _retry_with_module_jdk(run_id: str, step: VerificationStep, diagnostics: list,
+                           used_major: int | None, executor, vlog=None) -> tuple[bool, list[str]]:
+    """A failed build step may have failed ONLY because the JVM didn't match a module's
+    own declared Java major — the mixed-major reactor case: one JVM builds the whole
+    reactor, so the per-step JAVA_HOME switch cannot split a legacy ``1.8`` module from
+    its Java-17 siblings. Rebuild each failing module FROM ITS OWN DIR with the exact
+    installed JDK its effective pom declares (``1.8`` ≡ ``8``); its reactor-built
+    dependencies are already in ~/.m2. Returns ``(all_green, notes)``: all_green only
+    when EVERY failing module was a genuine mismatch AND rebuilt clean — a module
+    already on its declared JDK, no matching JDK installed, or a still-red retry keeps
+    the original failure verdict untouched. Best-effort; never raises."""
+    try:
+        from app.agents import jdk_discovery
+        rdir = workspace_local.repo_dir(run_id, step.repo_id)
+        dirs = sorted(_failing_module_dirs(rdir, step, diagnostics))
+        if not dirs or len(dirs) > _JDK_RETRY_CAP:
+            return False, []
+        # The retry runs FROM the module dir, so reactor-scoped selectors don't
+        # apply there: `-pl <module> -am` resolves against the ROOT reactor and
+        # would fail with "project not found" when run inside the module itself.
+        argv = list(step.argv)
+        if "-pl" in argv:
+            i = argv.index("-pl")
+            del argv[i:i + 2]
+            if "-am" in argv:
+                argv.remove("-am")
+        notes: list[str] = []
+        for md in dirs:
+            required = detect_module_java(rdir, md)
+            if not required or required == used_major:
+                return False, []                   # not a JDK mismatch — a real code failure
+            home = jdk_discovery.select_jdk_home(required)
+            if not home:
+                return False, [f"{md}: declares Java {required} but no JDK {required} is "
+                               f"installed — install it to build this module"]
+            logger.info("verify: run=%s JDK-mismatch retry module=%s declared=%d ran_on=%s → %s",
+                        run_id, md, required, used_major or "?", home)
+            work = rdir if md == "." else rdir / md
+            res = executor.run_command(work, argv, env_overrides={"JAVA_HOME": home})
+            if vlog is not None:
+                try:
+                    vlog.write(f"\n=== JDK-mismatch retry · {md} · JAVA_HOME={home} ===")
+                    vlog.write("$ " + " ".join(argv))
+                    vlog.write(f"[exit={res.exit_code} timed_out={res.timed_out}]")
+                except Exception:  # noqa: BLE001
+                    pass
+            if res.timed_out or res.exit_code != 0:
+                return False, []
+            notes.append(f"{md}: built with JDK {required} (module declares Java {required}; "
+                         f"the step ran on JDK {used_major or 'unknown'})")
+        return True, notes
+    except Exception:  # noqa: BLE001 — the retry is best-effort; the original verdict stands
+        return False, []
 
 
 def _root_aggregates(repo_dir: Path) -> bool:
@@ -744,31 +911,48 @@ def run_plan(db, run_id: str, plan: list[VerificationStep], *, touched_modules: 
     compile_failed = False                 # a build step failed → tests can't run (no classes)
     env_reason = ""
 
-    # JDK switching (Java-version awareness): build each repo with the JDK its poms
-    # target, if a matching one is installed. e.g. a Java-25 repo on a box whose
-    # default is 17 → build with the installed JDK 25 instead of failing on
-    # "invalid target release: 25". Best-effort + cached per repo; falls back to the
-    # active JDK (then the env-classifier reports "install JDK N" if that fails).
-    _repo_jdk: dict[str, dict | None] = {}
+    # JDK switching (Java-version awareness): build each STEP with the JDK the
+    # module's own effective pom declares (legacy "1.8" and modern "8" are the same
+    # major 8), falling back to the repo-wide highest declaration for reactor-root
+    # builds — so a legacy Java-8 module inside a Java-17 repo is built with JDK 8,
+    # not condemned by the repo max. Best-effort + cached per (repo, module dir);
+    # falls back to the active JDK (then the env-classifier reports "install JDK N"
+    # if that fails).
+    _step_jdk: dict[tuple, tuple] = {}
 
-    def _jdk_env_for(rid: str) -> dict | None:
-        if rid in _repo_jdk:
-            return _repo_jdk[rid]
-        ov = None
+    def _jdk_env_for(rid: str, module_dir: str | None) -> tuple[dict | None, int | None]:
+        key = (rid, module_dir or "")
+        if key in _step_jdk:
+            return _step_jdk[key]
+        ov, major = None, None
         try:
             from app.agents import jdk_discovery
-            required = detect_required_java(workspace_local.repo_dir(run_id, rid))
+            rdir = workspace_local.repo_dir(run_id, rid)
+            required = (detect_module_java(rdir, module_dir) if module_dir else None) \
+                or detect_required_java(rdir)
             home = jdk_discovery.select_jdk_home(required)
             if required and home:
-                ov = {"JAVA_HOME": home}
-                logger.info("verify: run=%s repo=%s build JDK → %d (%s)", run_id, rid, required, home)
+                ov, major = {"JAVA_HOME": home}, required
+                logger.info("verify: run=%s repo=%s module=%s build JDK → %d (%s)",
+                            run_id, rid, module_dir or ".", required, home)
             elif required:
-                logger.info("verify: run=%s repo=%s targets JDK %d but none installed — "
-                            "build will use the active JDK", run_id, rid, required)
+                logger.info("verify: run=%s repo=%s module=%s targets JDK %d but none installed — "
+                            "build will use the active JDK", run_id, rid, module_dir or ".", required)
         except Exception:  # noqa: BLE001 — switching is best-effort
-            ov = None
-        _repo_jdk[rid] = ov
-        return ov
+            ov, major = None, None
+        _step_jdk[key] = (ov, major)
+        return ov, major
+
+    # The JVM major a step actually ran on: the per-step override, else the box's
+    # active JDK (resolved lazily, once — it spawns `java -version`).
+    _active_major: list = []
+
+    def _jvm_used(ov_major: int | None) -> int | None:
+        if ov_major is not None:
+            return ov_major
+        if not _active_major:
+            _active_major.append(_active_jdk_major())
+        return _active_major[0]
 
     logger.info("verify: run=%s executing %d step(s) touched_modules=%s", run_id, len(plan), sorted(touched_modules))
     # Dedicated, findable verify build log: the FULL mvn output per step lands in
@@ -805,7 +989,8 @@ def run_plan(db, run_id: str, plan: list[VerificationStep], *, touched_modules: 
             logger.info("verify: run=%s step %d/%d kind=%s module=%s → %s",
                         run_id, i + 1, len(plan), step.kind, step.module, " ".join(step.argv))
             try:
-                _ov = _jdk_env_for(step.repo_id)
+                _ov, _ov_major = _jdk_env_for(
+                    step.repo_id, step.subdir if step.subdir not in (None, "", ".") else None)
                 res = (executor.run_command(work, step.argv, env_overrides=_ov)
                        if _ov else executor.run_command(work, step.argv))
             except CommandNotAllowed as e:
@@ -838,6 +1023,20 @@ def run_plan(db, run_id: str, plan: list[VerificationStep], *, touched_modules: 
                 logger.warning("verify: run=%s step %d/%d kind=%s TIMED OUT", run_id, i + 1, len(plan), step.kind)
                 gates["timeout"] = False
             gate_pass, hard, soft, step_env_reason, _req_java = _step_gate(step, res, effective_soft, skip_patterns)
+            # JDK-mismatch retry: a hard build failure whose failing module declares a
+            # DIFFERENT Java major than the JVM the step ran on (the mixed-major
+            # reactor case) is rebuilt per-module with the matching installed JDK —
+            # a legacy Java-8 module gets BUILT, not skipped. A clean retry lifts the
+            # step out of the failure verdict; anything else leaves it untouched.
+            _retry_notes: list[str] = []
+            if (not gate_pass and not res.timed_out and not step_env_reason
+                    and step.kind in ("generate_sources", "install", "compile")):
+                _full0 = (res.stdout or "") + "\n" + (res.stderr or "")
+                _retry_ok, _retry_notes = _retry_with_module_jdk(
+                    run_id, step, _diagnostic_lines(_full0, step), _jvm_used(_ov_major),
+                    executor, vlog)
+                if _retry_ok:
+                    gate_pass, hard, soft = True, 0, 0
             if step.kind in ("generate_sources", "install", "compile") and not gate_pass:
                 gates["compile"] = False
             elif step.kind == "test" and not gate_pass:
@@ -874,10 +1073,14 @@ def run_plan(db, run_id: str, plan: list[VerificationStep], *, touched_modules: 
             if gate_pass:
                 # Don't overwrite a module already marked failed/skipped-after-fail.
                 if module_results.get(label, {}).get("status") != "failed":
-                    module_results[label] = {"status": "built", "errors": []}
+                    # A JDK-mismatch retry that rescued the step is never a silent
+                    # green — the per-module rebuild note shows in the report.
+                    module_results[label] = {"status": "built", "errors": list(_retry_notes)}
             else:
+                # _retry_notes on a FAILED step carry the actionable toolchain gap
+                # ("declares Java 8 but no JDK 8 is installed") — lead with it.
                 module_results[label] = {"status": "failed",
-                                         "errors": format_step_errors(sr)[:8]}
+                                         "errors": (_retry_notes + format_step_errors(sr))[:8]}
                 failed_modules.add(label)
                 if step.kind in ("generate_sources", "install", "compile"):
                     compile_failed = True

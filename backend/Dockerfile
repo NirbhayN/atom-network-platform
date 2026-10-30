@@ -59,6 +59,21 @@ RUN curl -fsSL -o /tmp/maven.tgz \
  && rm -f /tmp/maven.tgz /tmp/maven.sha512 \
  && mvn -v
 
+# Temurin JDK 8 ALONGSIDE the default JDK: the verify gate resolves each Maven
+# module's own declared Java major (legacy "1.8" and modern "8" both → 8, see
+# app/agents/verification_plan.py detect_module_java) and builds the module with a
+# MATCHING installed JDK (app/agents/jdk_discovery.py scans /usr/lib/jvm) — so a
+# legacy Java-8 module is genuinely built instead of excluded from the verdict.
+# The signed-by key stays an .asc (apt reads armored keys directly; no gnupg dep).
+# The trailing `javac -version` fails the image build loudly if JDK 8 can't run.
+RUN curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+      -o /usr/share/keyrings/adoptium.asc \
+ && echo "deb [signed-by=/usr/share/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+      > /etc/apt/sources.list.d/adoptium.list \
+ && apt-get update && apt-get install -y temurin-8-jdk \
+ && /usr/lib/jvm/temurin-8-jdk-*/bin/javac -version \
+ && rm -rf /var/lib/apt/lists/*
+
 # Eclipse JDT Language Server (jdtls) for the OPTIONAL agentic LSP diagnostics tool
 # (AGENTIC_LSP_ENABLED). It's a ~1 GB JVM server, so it's OFF by default and NOT baked
 # in unless you ask: high-RAM prod/dev hosts build with `--build-arg INSTALL_JDTLS=true`,

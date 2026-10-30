@@ -814,9 +814,11 @@ class Settings(BaseSettings):
     # On a code-change cap, re-enter the SAME workspace and keep going (continue from
     # where it left off) up to this many continuations before stopping — lets large
     # multi-file features finish unattended. Each continuation emits a ⚠ warning.
-    # ACCURACY-FIRST: raised so a large multi-file change isn't cut off before it's complete
-    # (the plan-gap check still stops it the moment the change IS complete).
-    agentic_max_code_continuations: int = 16
+    # 64 (slipstream): the enforced per-run token budget and the no-progress abort are
+    # the real bounds, not an arbitrary round count — a large change runs until it is
+    # done, stalls, or exhausts its budget (the plan-gap check still stops it the
+    # moment the change IS complete).
+    agentic_max_code_continuations: int = 64
     # S7 — XSD→Java link confidence floor (§7.3). Links below this are routed to
     # the "needs confirmation" list and NEVER presented as definite.
     xsd_link_min_confidence: float = 0.55
@@ -860,9 +862,11 @@ class Settings(BaseSettings):
     # survives even this, the push is HARD-BLOCKED until it's resolved or explicitly overridden.
     agentic_max_blocker_rounds: int = 10
     # S13 — orchestrator (§3). Verification failures loop back to code-change at most this many
-    # attempts. ACCURACY-FIRST: stops the instant the build+tests pass; also absorbs review
-    # loop-backs (which share this counter), so it's set well above the review ceilings.
-    agentic_max_code_attempts: int = 14
+    # attempts. Stops the instant the build+tests pass; also absorbs review loop-backs
+    # (which share this counter), so it sits well above the review ceilings.
+    # 40 (slipstream): the token budget, not a round count, decides when a run that is
+    # still making progress against real compiler errors has to stop.
+    agentic_max_code_attempts: int = 40
     # Governance review stages (EA → InfoSec) between code approval and Build. Off by
     # default: with the flag off every touchpoint is inert (start 409s, the
     # agentic-complete gate is skipped, the UI renders the plain Build CTA).
@@ -914,11 +918,23 @@ class Settings(BaseSettings):
     # absent modules the operator has deemed out of scope (e.g. `*igw*,*hsm-proxy*`).
     # Unconditional (unlike agentic_soft_fail_modules, which re-gates a touched module).
     agentic_verify_skip_modules: str = ""
+    # ── SLIPSTREAM posture (the default gate stance) ───────────────────────────────
+    # The code loop runs self-directed: the agent explores, edits, and verifies
+    # against the REAL build (run_command / verify_change), and only two things can
+    # stop a change hard — the deterministic build verdict and the human at push
+    # approval. Every analytical gate (approach, contract, DI wiring, acceptance
+    # predicates, behavioural plan-fidelity) runs in measure/advise mode: findings
+    # are injected into the loop as feedback and surfaced at the human gate, but
+    # never block a push or burn fix rounds on their own. Flip the individual
+    # *_enforce / gate flags to harden any one of them back into a blocker.
+    #
     # Reuse-first "approach decision" gate: before creating any API/XSD
     # the agent maps the existing flows and STOPS to present the human reuse-vs-new
-    # options + a recommendation. ON by default; set false to skip the propose pass and
-    # go straight through (legacy behaviour).
-    agentic_approach_gate: bool = True
+    # options + a recommendation. OFF by default (slipstream): the agent proceeds on
+    # the mapped flows and its own judgment — reuse evidence still reaches the loop
+    # via the reuse-decision tool and the schema guardian. Set true to restore the
+    # human stop before any new API/XSD is authored.
+    agentic_approach_gate: bool = False
     # Parallel review (default OFF): overlap the correctness/completeness reviewer and the
     # independent plan-fidelity gate (both read-only LLM calls). Latency only — the merge is
     # deterministic so the verdict is byte-identical to the sequential default, which the
@@ -931,7 +947,11 @@ class Settings(BaseSettings):
     # shipped. Deterministic gaps (missing files / stubs via `_plan_gap_feedback`) and real reviewer
     # blockers are unaffected. Set False for the legacy "loop on any behavioural gap" behaviour.
     agentic_behavioral_gap_advisory: bool = True
-    agentic_max_behavioral_rounds: int = 2
+    # 0 (slipstream): behavioural-completeness opinions are advisory from the FIRST
+    # review round — surfaced to the agent and escalated to the human gate, never
+    # spending loop-back rounds on an LLM opinion. Raise to let such gaps drive
+    # that many fix rounds before going advisory (2 was the pre-slipstream default).
+    agentic_max_behavioral_rounds: int = 0
     # R5 converge-or-escalate: if the OPEN must-block set does not strictly shrink over this many review
     # rounds, stop looping and route to the human gate (blockers stay flagged via has_blocker) instead of
     # burning rounds re-attempting a fix the agent can't land. 0 disables (rely on the absolute caps only).
@@ -970,14 +990,12 @@ class Settings(BaseSettings):
     # push until satisfied. This is the DETERMINISTIC completeness gate that replaces the LLM blocker §8.5c
     # demoted to advisory. Requires `agentic_acceptance_predicates` on. Fail-open + the LLM-advisory and
     # human push-gate remain as backstops.
-    # ENFORCING. The shadow rollout (agentic_acceptance_predicates=True,
-    # measuring since its introduction) found no false-unmet signal against
-    # the standard the flag's own comment set as the bar, so this shadow gate
-    # was flipped to enforcing (alongside pointing agentic_reviewer_model away
-    # from the author's own model), and is now a real blocker.
-    # Fail-open + the LLM-advisory review and the
-    # human push-gate remain as backstops if this gate itself errors.
-    agentic_acceptance_predicates_enforce: bool = True
+    # SHADOW (slipstream): predicates are measured and surfaced — to the agent as
+    # in-loop feedback and to the human at push approval — but do not block. The
+    # build verdict and the human remain the only hard stops. Set True to restore
+    # the deterministic completeness blocker (its shadow rollout did measure zero
+    # false-unmet, so hardening it back is a safe single-flag change).
+    agentic_acceptance_predicates_enforce: bool = False
     # Document↔CODE consistency gate (post-codegen). After the change-set freezes, audit the generated
     # TSD's CONCRETE implementation claims (DB columns, config keys, error codes, named methods) against
     # the ACTUAL diff; a claim the code doesn't support means the DOC is wrong → reconcile the TSD to the
@@ -1033,13 +1051,11 @@ class Settings(BaseSettings):
     # Fail-open. See app/agents/di_wiring_gate.py. Phase 2 (scoped @SpringBootTest slice boot via the
     # vestigial "smoke" VerificationStep) needs live-run validation before it can be built.
     agentic_di_gate: bool = True
-    # ENFORCING — flipped out of shadow mode. Unlike the contract
-    # gate above, this gate's false-positive risk was already bounded at
-    # design time (DELTA-SCOPED to changed classes only, so legacy wiring
-    # noise cannot trip it) — the shadow rollout comment's own "Fail-open"
-    # guarantee plus that scoping is why this one is safe to flip today while
-    # the contract gate is not.
-    agentic_di_gate_enforce: bool = True
+    # SHADOW (slipstream): wiring findings surface as in-loop feedback and
+    # human-gate notes instead of blocking rounds. The gate stays ON for signal
+    # (delta-scoping keeps its false-positive risk bounded, so hardening it back
+    # with True remains a safe single-flag change for a stricter deployment).
+    agentic_di_gate_enforce: bool = False
     # ADR-0005 — stops the TSD being treated as a prose document rather than a
     # binding contract. When True, CODE_CHANGE phase entry (kind='code' runs, and the
     # full-run pipeline's XSD→CODE_CHANGE transition) checks whether the

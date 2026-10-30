@@ -35,7 +35,9 @@ from __future__ import annotations
 
 from typing import Any
 
-ALLOWED_FILE_ACTIONS = ("create", "modify")
+# "delete" matches the live submit_plan tool contract (agentic_tools.TOOL_SCHEMAS),
+# which has always advertised create|modify|delete to the code agent.
+ALLOWED_FILE_ACTIONS = ("create", "modify", "delete")
 MIN_INTENT_CHARS = 12
 
 # Schema-level keys

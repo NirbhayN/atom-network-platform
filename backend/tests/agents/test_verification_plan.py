@@ -443,3 +443,334 @@ def test_skip_patterns_regex_metacharacters_are_neutralised(monkeypatch):
     assert len(pats) == 1
     assert pats[0].search(r"(a+)+$")
     assert not pats[0].search("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!")
+
+
+# ── Per-module Java detection (legacy "1.8" ≡ modern "8") + JDK-mismatch retry ──────
+
+def _pom(p, text):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+
+
+def test_java_major_normalises_both_version_schemes():
+    # "java 8" and "java 1.8" are the SAME major — never two different answers.
+    assert V._java_major_of("1.8") == 8
+    assert V._java_major_of("8") == 8
+    assert V._java_major_of("1.8.0_292") == 8
+    assert V._java_major_of("17") == 17
+    assert V._java_major_of("11") == 11
+    assert V._java_major_of("1") is None                     # never a real release
+    assert V._java_major_of("notaversion") is None
+    assert V._java_major_of("${java.version}", {"java.version": "1.8"}) == 8
+    assert V._java_major_of("${jdk}", {"jdk": "${java.version}", "java.version": "8"}) == 8
+    assert V._java_major_of("${missing}", {}) is None
+
+
+def test_detect_module_java_mixed_major_repo(tmp_path):
+    # Root parent on 17 (via ${java.version}); one legacy module pinned to 1.8.
+    # Each module resolves to its OWN major; the repo-wide max stays 17.
+    _pom(tmp_path / "pom.xml",
+         "<project><properties><java.version>17</java.version></properties>"
+         "<maven.compiler.source>${java.version}</maven.compiler.source></project>")
+    _pom(tmp_path / "legacy-igw" / "pom.xml",
+         "<project><maven.compiler.source>1.8</maven.compiler.source>"
+         "<maven.compiler.target>1.8</maven.compiler.target></project>")
+    _pom(tmp_path / "modern" / "pom.xml", "<project></project>")
+    assert V.detect_module_java(tmp_path, "legacy-igw") == 8   # own pom wins; 1.8 ≡ 8
+    assert V.detect_module_java(tmp_path, "modern") == 17      # inherits the parent
+    assert V.detect_required_java(tmp_path) == 17              # repo max unchanged
+
+
+def test_detect_module_java_property_override_beats_parent(tmp_path):
+    # Parent declares <source>${java.version}</source> with 17; the module overrides
+    # the PROPERTY to 1.8 → the module's effective major is 8 (Maven's effective-pom
+    # rule), not the parent's literal.
+    _pom(tmp_path / "pom.xml",
+         "<project><properties><java.version>17</java.version></properties>"
+         "<maven.compiler.source>${java.version}</maven.compiler.source></project>")
+    _pom(tmp_path / "legacy" / "pom.xml",
+         "<project><properties><java.version>1.8</java.version></properties></project>")
+    assert V.detect_module_java(tmp_path, "legacy") == 8
+
+
+class _EnvExec:
+    """Fake adapter that accepts env_overrides: builds fail on the default JVM; a
+    build under any matching /fake/jdkN JAVA_HOME passes — unless `stubborn`, where
+    even the right JDK doesn't save it (a real code failure in a legacy module)."""
+    def __init__(self, fail_out, stubborn=False):
+        self.fail_out = fail_out
+        self.stubborn = stubborn
+        self.calls = []
+        self.argvs = []
+
+    def run_command(self, cwd, argv, timeout_s=None, env_overrides=None):
+        self.calls.append((str(cwd), env_overrides))
+        self.argvs.append(list(argv))
+        if (not self.stubborn and env_overrides
+                and "/fake/jdk" in (env_overrides.get("JAVA_HOME") or "")):
+            return _res(0)
+        return _res(1, stdout=self.fail_out)
+
+
+def _mixed_repo(tmp_path):
+    _pom(tmp_path / "pom.xml",
+         "<project><properties><java.version>17</java.version></properties>"
+         "<maven.compiler.source>${java.version}</maven.compiler.source>"
+         "<module>legacy-igw</module></project>")
+    _pom(tmp_path / "legacy-igw" / "pom.xml",
+         "<project><maven.compiler.source>1.8</maven.compiler.source></project>")
+    return tmp_path
+
+
+def _patch_jdk_env(monkeypatch, tmp_path, *, installed=(8,)):
+    from app.agents import jdk_discovery, workspace_local
+    monkeypatch.setattr(workspace_local, "repo_dir", lambda run, rid: tmp_path)
+    monkeypatch.setattr(jdk_discovery, "select_jdk_home",
+                        lambda req, **kw: f"/fake/jdk{req}" if req in installed else None)
+    monkeypatch.setattr(V, "_active_jdk_major", lambda: 17)
+
+
+def test_jdk_mismatch_retry_builds_legacy_java8_module(monkeypatch, tmp_path):
+    # Mixed-major reactor: the full build fails ONLY inside the module whose own pom
+    # declares 1.8, while the step ran on JDK 17. The runtime must rebuild that module
+    # from its own dir with the installed JDK 8 and lift it out of the verdict —
+    # BUILT, not skipped.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8,))      # JDK 8 installed, 17 not
+    fail = ("[INFO] Building legacy-igw 1.0\n"
+            "[INFO] --- maven-compiler-plugin:3.11:compile (default) @ legacy-igw ---\n"
+            f"[ERROR] {repo}/legacy-igw/src/Bar.java:[5,1] incompatible types\n"
+            "[INFO] BUILD FAILURE\n")
+    step = VerificationStep("install", "r1", ["mvn", "-B", "install"],
+                            module="core (full build)", subdir=None)
+    ex = _EnvExec(fail)
+    out = run_plan(None, RUN, [step], touched_modules=set(), soft_fail_modules=set(), executor=ex)
+    assert out.status == "verified" and out.gates["compile"] is True
+    assert out.module_results["core (full build)"]["status"] == "built"
+    # The rescue is never a silent green — the rebuild note names module + JDK.
+    assert any("JDK 8" in n for n in out.module_results["core (full build)"]["errors"])
+    # Retry ran FROM the module dir WITH the matching JAVA_HOME.
+    retry_calls = [c for c in ex.calls if c[1]]
+    assert retry_calls and retry_calls[0][0].endswith("legacy-igw")
+    assert retry_calls[0][1]["JAVA_HOME"] == "/fake/jdk8"
+
+
+def test_no_retry_when_module_major_matches_the_jvm(monkeypatch, tmp_path):
+    # The failing module already built on its own declared major → a real code
+    # failure; the retry must NOT fire and the verdict stays needs_fix.
+    _pom(tmp_path / "pom.xml", "<project></project>")
+    _pom(tmp_path / "legacy-igw" / "pom.xml",
+         "<project><maven.compiler.source>17</maven.compiler.source></project>")
+    _patch_jdk_env(monkeypatch, tmp_path, installed=())
+    fail = (f"[ERROR] {tmp_path}/legacy-igw/src/Bar.java:[5,1] cannot find symbol\n"
+            "[INFO] BUILD FAILURE\n")
+    step = VerificationStep("install", "r1", ["mvn", "-B", "install"],
+                            module="core (full build)", subdir=None)
+    ex = _EnvExec(fail)
+    out = run_plan(None, RUN, [step], touched_modules=set(), soft_fail_modules=set(), executor=ex)
+    assert out.status == "needs_fix" and out.gates["compile"] is False
+    assert not [c for c in ex.calls if c[1]], "no JAVA_HOME retry for a matching major"
+
+
+# ── Detection edge cases ────────────────────────────────────────────────────────────
+
+def test_java_major_edge_values():
+    assert V._java_major_of("  1.8  ") == 8                  # whitespace tolerated
+    assert V._java_major_of("") is None
+    assert V._java_major_of(None) is None
+    assert V._java_major_of("21-ea") == 21                   # early-access suffix
+    # A property CYCLE must terminate and answer "undeclared", never hang.
+    assert V._java_major_of("${a}", {"a": "${b}", "b": "${a}"}) is None
+
+
+def test_detect_module_java_nested_module_nearest_ancestor_wins(tmp_path):
+    # repo(17) > mid(11) > leaf(no decl): leaf resolves to the NEAREST declaring
+    # ancestor (11), not the repo root; a leaf with its own 1.8 resolves to 8.
+    _pom(tmp_path / "pom.xml",
+         "<project><maven.compiler.source>17</maven.compiler.source></project>")
+    _pom(tmp_path / "mid" / "pom.xml",
+         "<project><maven.compiler.source>11</maven.compiler.source></project>")
+    _pom(tmp_path / "mid" / "leaf" / "pom.xml", "<project></project>")
+    _pom(tmp_path / "mid" / "pinned" / "pom.xml",
+         "<project><java.version>1.8</java.version></project>")
+    assert V.detect_module_java(tmp_path, "mid/leaf") == 11
+    assert V.detect_module_java(tmp_path, "mid/pinned") == 8
+    assert V.detect_module_java(tmp_path, None) == 17        # root/reactor question
+    assert V.detect_module_java(tmp_path, ".") == 17
+
+
+def test_detect_module_java_source_target_max_and_no_pom(tmp_path):
+    # Within ONE pom, source=8 target=11 → the higher bound wins (the JVM must
+    # satisfy both); a tree with no pom anywhere answers None (don't guess).
+    _pom(tmp_path / "m" / "pom.xml",
+         "<project><maven.compiler.source>1.8</maven.compiler.source>"
+         "<maven.compiler.target>11</maven.compiler.target></project>")
+    assert V.detect_module_java(tmp_path, "m") == 11
+    assert V.detect_module_java(tmp_path / "empty", "x") is None
+
+
+def test_detect_required_java_resolves_root_property_in_child(tmp_path):
+    # Child pom consumes a property DECLARED ONLY at the root: the repo scan must
+    # resolve it (the pre-fix numeric-only regex skipped ${...} values entirely).
+    _pom(tmp_path / "pom.xml",
+         "<project><properties><java.version>21</java.version></properties></project>")
+    _pom(tmp_path / "child" / "pom.xml",
+         "<project><maven.compiler.release>${java.version}</maven.compiler.release></project>")
+    assert V.detect_required_java(tmp_path) == 21
+
+
+# ── Upfront per-step JDK selection ──────────────────────────────────────────────────
+
+def _step(argv=None, module="core (full build)", subdir=None, kind="install"):
+    return VerificationStep(kind, "r1", argv or ["mvn", "-B", "install"],
+                            module=module, subdir=subdir)
+
+
+def test_build_from_dir_step_selects_module_jdk_upfront(monkeypatch, tmp_path):
+    # A build-from-dir step for the 1.8 module runs on JDK 8 from the FIRST attempt —
+    # no failure, no retry needed.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8, 17))
+    ex = _EnvExec("unused")
+    out = run_plan(None, RUN, [_step(module="legacy-igw", subdir="legacy-igw")],
+                   touched_modules=set(), soft_fail_modules=set(), executor=ex)
+    assert out.status == "verified"
+    assert ex.calls[0][0].endswith("legacy-igw")
+    assert ex.calls[0][1] == {"JAVA_HOME": "/fake/jdk8"} and len(ex.calls) == 1
+
+
+def test_reactor_step_falls_back_to_repo_max_jdk(monkeypatch, tmp_path):
+    # A reactor-root step (subdir None) keeps the repo-wide max (17 here).
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8, 17))
+    ex = _EnvExec("unused")
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "verified"
+    assert ex.calls[0][1] == {"JAVA_HOME": "/fake/jdk17"}
+
+
+# ── Retry scenarios ────────────────────────────────────────────────────────────────
+
+def _fail_lines(repo, *rel_files):
+    lines = "".join(f"[ERROR] {repo}/{f}:[5,1] incompatible types\n" for f in rel_files)
+    return f"{lines}[INFO] BUILD FAILURE\n"
+
+
+def test_retry_surfaces_missing_jdk_as_actionable_note(monkeypatch, tmp_path):
+    # Mismatch detected but JDK 8 is NOT installed: the failure stays, and the
+    # module report LEADS with "install JDK 8", not a cryptic compile error.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=())
+    ex = _EnvExec(_fail_lines(repo, "legacy-igw/src/Bar.java"))
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "needs_fix"
+    errs = out.module_results["core (full build)"]["errors"]
+    assert errs and "no JDK 8 is installed" in errs[0]
+    assert not [c for c in ex.calls if c[1]], "no retry without a matching JDK"
+
+
+def test_retry_that_still_fails_keeps_the_failure(monkeypatch, tmp_path):
+    # Right JDK, still red → a REAL code failure in the legacy module: verdict stands.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8,))
+    ex = _EnvExec(_fail_lines(repo, "legacy-igw/src/Bar.java"), stubborn=True)
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "needs_fix" and out.gates["compile"] is False
+    assert out.module_results["core (full build)"]["status"] == "failed"
+
+
+def test_retry_rescues_multiple_mismatched_modules(monkeypatch, tmp_path):
+    # TWO legacy 1.8 modules fail in one reactor pass → both rebuilt on JDK 8.
+    _pom(tmp_path / "pom.xml",
+         "<project><maven.compiler.source>17</maven.compiler.source></project>")
+    for m in ("legacy-a", "legacy-b"):
+        _pom(tmp_path / m / "pom.xml",
+             "<project><maven.compiler.source>1.8</maven.compiler.source></project>")
+    _patch_jdk_env(monkeypatch, tmp_path, installed=(8,))
+    ex = _EnvExec(_fail_lines(tmp_path, "legacy-a/src/A.java", "legacy-b/src/B.java"))
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "verified"
+    notes = out.module_results["core (full build)"]["errors"]
+    assert len(notes) == 2 and all("JDK 8" in n for n in notes)
+    retry_dirs = sorted(c[0] for c in ex.calls if c[1])
+    assert retry_dirs[0].endswith("legacy-a") and retry_dirs[1].endswith("legacy-b")
+
+
+def test_retry_refuses_when_any_failing_module_is_not_a_mismatch(monkeypatch, tmp_path):
+    # One failing module is 1.8 (mismatch) but another failed ON its declared major —
+    # the breakage is not purely toolchain, so the verdict must stand.
+    _pom(tmp_path / "pom.xml", "<project></project>")
+    _pom(tmp_path / "legacy-igw" / "pom.xml",
+         "<project><maven.compiler.source>1.8</maven.compiler.source></project>")
+    _pom(tmp_path / "ok17" / "pom.xml",
+         "<project><maven.compiler.source>17</maven.compiler.source></project>")
+    # 17 deliberately NOT installed: the reactor runs on the active JDK 17 anyway
+    # (ok17 fails ON its declared major → a real code failure, not a mismatch).
+    _patch_jdk_env(monkeypatch, tmp_path, installed=(8,))
+    ex = _EnvExec(_fail_lines(tmp_path, "legacy-igw/src/A.java", "ok17/src/B.java"))
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "needs_fix" and out.gates["compile"] is False
+
+
+def test_retry_cap_stops_systemic_breakage(monkeypatch, tmp_path):
+    # More than _JDK_RETRY_CAP failing modules = systemic, not a toolchain mismatch.
+    # Root pins 17 (not installed) so the reactor runs on the active JDK and fails.
+    _pom(tmp_path / "pom.xml",
+         "<project><maven.compiler.source>17</maven.compiler.source></project>")
+    mods = [f"m{i}" for i in range(1, 7)]
+    for m in mods:
+        _pom(tmp_path / m / "pom.xml",
+             "<project><maven.compiler.source>1.8</maven.compiler.source></project>")
+    _patch_jdk_env(monkeypatch, tmp_path, installed=(8,))
+    ex = _EnvExec(_fail_lines(tmp_path, *[f"{m}/src/X.java" for m in mods]))
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "needs_fix"
+    assert not [c for c in ex.calls if c[1]], "no per-module retries above the cap"
+
+
+def test_retry_strips_reactor_selectors_from_argv(monkeypatch, tmp_path):
+    # `-pl <module> -am` resolves against the ROOT reactor; the retry runs FROM the
+    # module dir, so those selectors must be stripped or Maven fails spuriously.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8,))
+    ex = _EnvExec(_fail_lines(repo, "legacy-igw/src/Bar.java"))
+    step = _step(argv=["mvn", "-pl", "legacy-igw", "-am", "-B", "clean", "install"])
+    out = run_plan(None, RUN, [step], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "verified"
+    retry_argv = [a for c, a in zip(ex.calls, ex.argvs) if c[1]][0]
+    assert "-pl" not in retry_argv and "-am" not in retry_argv
+    assert "install" in retry_argv and "clean" in retry_argv
+
+
+def test_retry_never_targets_the_repo_root(monkeypatch, tmp_path):
+    # A failing file directly under the repo root resolves to module "." — rebuilding
+    # the whole reactor is NOT a targeted retry, even when the root declares 1.8 and
+    # JDK 8 is installed (a full-reactor rerun on jdk8 would wrongly go green here).
+    _pom(tmp_path / "pom.xml",
+         "<project><maven.compiler.source>1.8</maven.compiler.source></project>")
+    _pom(tmp_path / "modern" / "pom.xml",
+         "<project><maven.compiler.source>17</maven.compiler.source></project>")
+    _patch_jdk_env(monkeypatch, tmp_path, installed=(8,))
+    ex = _EnvExec(_fail_lines(tmp_path, "src/Root.java"))
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules=set(), executor=ex)
+    assert out.status == "needs_fix"
+    assert not [c for c in ex.calls if c[1]]
+
+
+def test_retry_tolerates_executors_without_env_overrides(monkeypatch, tmp_path):
+    # An adapter that doesn't accept env_overrides (older backends / fakes) must not
+    # crash the gate — the retry degrades to "no rescue", verdict unchanged.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8,))
+    fail = _fail_lines(repo, "legacy-igw/src/Bar.java")
+    out = run_plan(None, RUN, [_step()], touched_modules=set(), soft_fail_modules=set(),
+                   executor=_Exec(lambda a: _res(1, stdout=fail)))
+    assert out.status == "needs_fix" and out.gates["compile"] is False

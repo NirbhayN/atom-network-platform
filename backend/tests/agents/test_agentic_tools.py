@@ -502,3 +502,57 @@ def test_edit_file_surfaces_the_facet_warning(ws):
     out = T.edit_file(ctx, RID, "s.xsd", '<xs:pattern value="[0-9]+"/>',
                       '<xs:pattern value="[0-9\\\\.]+"/>')
     assert "edited s.xsd" in out and "LITERAL BACKSLASH" in out
+
+
+# ── submit_plan validation: malformed file entries bounce with the issues ──────────
+
+def test_submit_plan_validates_file_entries(ws):
+    ctx = _ctx()
+    # Well-formed entries (incl. the delete action the tool contract advertises) record.
+    out = T.submit_plan(ctx, "wire the refund flow", files=[
+        {"path": "src/A.java", "action": "modify", "intent": "add refund handler branch"},
+        {"path": "src/old/B.java", "action": "delete", "intent": "superseded by A's handler"},
+    ])
+    assert "2 file(s)" in out and len(ctx.plan["files"]) == 2
+
+    # Key-name drift (the plan_files 13-dropped-files bug class) bounces loudly
+    # instead of being stored under a variant key the fidelity gate can't read.
+    with pytest.raises(T.ToolError) as e:
+        T.submit_plan(ctx, "drifted", files=[{"file": "src/A.java", "action": "edit"}])
+    msg = str(e.value)
+    assert "path" in msg and "intent" in msg and "action" in msg
+    assert ctx.plan["summary"] == "wire the refund flow"   # bad submission replaced nothing
+
+
+def test_submit_plan_summary_only_and_empty_summary(ws):
+    ctx = _ctx()
+    assert T.submit_plan(ctx, "orient first, file list follows") == "plan recorded"
+    with pytest.raises(T.ToolError):
+        T.submit_plan(ctx, "   ")
+
+
+def test_submit_plan_via_dispatcher_surfaces_issues(ws):
+    # The model sees the exact issues as an is_error tool_result and can re-submit.
+    ctx = _ctx()
+    out, is_error = T.execute_tool(ctx, "submit_plan", {
+        "summary": "drift", "files": [{"file": "A.java", "action": "edit"}]})
+    assert is_error and "missing required key `path`" in out
+    assert ctx.plan is None, "a bounced submission records nothing"
+    out, is_error = T.execute_tool(ctx, "submit_plan", {
+        "summary": "ok", "files": [{"path": "src/A.java", "action": "modify",
+                                    "intent": "bump x to satisfy the spec"}]})
+    assert not is_error and "1 file(s)" in out
+    assert ctx.plan["files"][0]["path"] == "src/A.java"
+
+
+def test_submit_plan_rejects_non_list_files_short_intent_and_non_dict_entries(ws):
+    ctx = _ctx()
+    with pytest.raises(T.ToolError):
+        T.submit_plan(ctx, "files as a bare string", files="src/A.java")
+    with pytest.raises(T.ToolError) as e:
+        T.submit_plan(ctx, "short intent",
+                      files=[{"path": "a.java", "action": "modify", "intent": "tiny"}])
+    assert "intent" in str(e.value)
+    with pytest.raises(T.ToolError):
+        T.submit_plan(ctx, "entry is not a dict", files=["src/A.java"])
+    assert ctx.plan is None

@@ -711,9 +711,28 @@ def ask_decision(ctx: RunContext, question: str, blocked_item: str,
 def submit_plan(ctx: RunContext, summary: str, files: list | None = None,
                 reuse_decisions: list | None = None,
                 reconciliation: list | None = None) -> str:
+    """The plan is stored WHOLESALE (each submission replaces the last), so malformed
+    ``files`` entries are bounced at the door with the exact issues instead of being
+    stored — downstream readers once tolerated five key-name variants because schema
+    drift here silently dropped 13 planned files from fidelity tracking while
+    reporting 0 missing (plan_files.py). A summary-only plan stays legal (turn-1
+    orientation before the file list firms up); the fidelity gate holds the agent to
+    whatever files it declared."""
+    if not (summary or "").strip():
+        raise ToolError("submit_plan NOT recorded — `summary` must be a non-empty string.")
+    if files:
+        from app.agents import code_plan_schema
+        report = code_plan_schema.validate({"files": files})
+        if not report["schema_valid"]:
+            raise ToolError(
+                "submit_plan NOT recorded — fix these issues and re-submit the FULL plan:\n- "
+                + "\n- ".join(report["issues"][:12])
+                + "\nEach files[] entry must be {path, action: create|modify|delete, "
+                  "intent: what changes in this file and why (≥12 chars)}.")
     ctx.plan = {"summary": summary, "files": files or [], "reuse_decisions": reuse_decisions or [],
                 "reconciliation": reconciliation or []}
-    return "plan recorded"
+    n = len(files or [])
+    return f"plan recorded — {n} file(s)" if n else "plan recorded"
 
 
 def _verify_evidence(ctx: RunContext, evidence: list) -> tuple[list, list]:
@@ -2406,8 +2425,11 @@ TOOL_SCHEMAS: list[dict] = [
             "summary": _str("what you will change and why"),
             "files": {"type": "array", "items": {"type": "object"},
                       "description": "ONE object per file as {path, action: create|modify|delete, "
-                                     "intent: what changes in this file and why}. Cover every file the "
-                                     "change touches end-to-end (parse → map → act → persist), not just one."},
+                                     "intent: what changes in this file and why (≥12 chars)}. Cover every "
+                                     "file the change touches end-to-end (parse → map → act → persist), not "
+                                     "just one. Entries are VALIDATED: a malformed entry (wrong key names, "
+                                     "missing intent, unknown action) rejects the whole submission with the "
+                                     "exact issues — fix them and re-submit the full plan."},
             "reuse_decisions": {"type": "array", "items": {"type": "object"},
                                 "description": "for each new thing: reuse|extend|new + why"},
             "reconciliation": {"type": "array", "items": {"type": "object"},

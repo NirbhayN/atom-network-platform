@@ -142,3 +142,22 @@ def test_cancel_check_stops_before_first_turn(ws, monkeypatch):
         run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go",
         db=None, cancel_check=lambda: True))
     assert res.stopped == "cancelled" and res.iterations == 0
+
+
+def test_bounced_plan_keeps_mutations_blocked(ws, monkeypatch):
+    # A submit_plan whose files fail validation is NOT recorded — turn-1 enforcement
+    # keeps refusing edits until a well-formed plan lands, so a malformed plan can
+    # never become a licence to mutate.
+    _script_runner(monkeypatch, [
+        _turn([ToolUseRequest("t1", "submit_plan",
+                              {"summary": "drift",
+                               "files": [{"file": "src/A.java", "action": "edit"}]})]),
+        _turn([ToolUseRequest("t2", "edit_file", {"repo_id": RID, "path": "src/A.java",
+                                                  "old_string": "int x = 1;",
+                                                  "new_string": "int x = 9;"})]),
+        _turn([], text="stopped", stop="end_turn"),
+    ])
+    res = asyncio.run(R.run_agent_loop(
+        run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go", db=None))
+    assert res.plan is None and res.change_set == []
+    assert "int x = 1;" in (ws / "src" / "A.java").read_text()

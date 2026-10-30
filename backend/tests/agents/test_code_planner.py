@@ -122,7 +122,11 @@ def test_missing_path_in_file_fails():
 
 
 def test_invalid_action_fails():
-    plan = {"files": [{"path": "x", "action": "delete", "intent": "remove dead code from x.java"}]}
+    # "delete" is a LEGAL action (the live submit_plan tool contract has always
+    # advertised create|modify|delete); a truly unknown verb still fails.
+    ok = {"files": [{"path": "x", "action": "delete", "intent": "remove dead code from x.java"}]}
+    assert code_plan_schema.validate(ok)["schema_valid"] is True
+    plan = {"files": [{"path": "x", "action": "rename", "intent": "remove dead code from x.java"}]}
     report = code_plan_schema.validate(plan)
     assert report["schema_valid"] is False
     assert any("must be one of" in m for m in report["issues"])
