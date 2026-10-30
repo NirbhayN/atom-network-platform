@@ -2814,8 +2814,10 @@ async def assess_xsd(change_id: str, db: DbDep, _: CurrentUser):
     async for chunk in stream_xsd_assessment(assessment_basis, brd.content, base_schemas=schema_ctx):
         full += chunk
 
-    # Determine if required from assessment text
-    is_required = "**REQUIRED**" in full and "NOT REQUIRED" not in full.split("**REQUIRED**")[0]
+    # Determine if required from the assessment's Decision SECTION (B4) — the old
+    # whole-document substring match flipped on prose like "a REQUIRED field".
+    from app.agents.xsd import parse_xsd_decision
+    is_required = parse_xsd_decision(full)
 
     # Upsert XSD record with assessment + is_required flag
     existing = (db.query(XSD)

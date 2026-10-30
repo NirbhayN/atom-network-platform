@@ -215,7 +215,7 @@ def test_apply_reports_rather_than_forcing_a_stale_proposal(ws):
         {"repo_id": RID, "path": "src/NET-Common.xsd", "kind": "edit",
          "old_string": "no longer present", "new_string": "x"}])
     assert not res["applied"] and len(res["failed"]) == 1
-    assert "no longer present" in res["failed"][0]["reason"]
+    assert "not found" in res["failed"][0]["reason"]
 
 
 def test_apply_refuses_an_ambiguous_match(ws):
@@ -227,7 +227,8 @@ def test_apply_refuses_an_ambiguous_match(ws):
     res = SA.apply(RUN, RUN, [
         {"repo_id": RID, "path": "src/NET-Common.xsd", "kind": "edit",
          "old_string": '<xs:enumeration value="BG"/>', "new_string": '<xs:enumeration value="GP"/>'}])
-    assert not res["applied"] and "ambiguous" in res["failed"][0]["reason"]
+    assert not res["applied"]
+    assert "occurs 2 times" in res["failed"][0]["reason"]   # the ladder's ambiguity refusal
 
 
 def test_apply_creates_a_new_schema_file(ws):
@@ -285,7 +286,7 @@ def test_apply_reports_failure_instead_of_forcing_a_stale_anchor(ws):
                                "old_string": '<xs:enumeration value="ZZ"/>',   # not present
                                "new_string": '<xs:enumeration value="GP"/>'}])
     assert not res["applied"] and len(res["failed"]) == 1
-    assert "no longer present" in res["failed"][0]["reason"]
+    assert "not found" in res["failed"][0]["reason"]
     assert 'value="GP"' not in (ws / "src" / "NET-Common.xsd").read_text(encoding="utf-8")
 
 
@@ -380,3 +381,19 @@ class _User:
     id = "u1"
     role = "admin"
     is_admin = True
+
+
+def test_apply_lands_despite_reformatted_whitespace(ws):
+    # B9 — a reformat between staging and approval (re-indent / trailing spaces) used
+    # to fail the exact-match replay; the edit ladder now lands it, still single-match
+    # guarded. The staged anchor has different indentation than the file.
+    from app.services import schema_amendment as SA
+    p = ws / "src" / "NET-Common.xsd"
+    p.write_text('<xs:schema>\n        <xs:enumeration value="BG"/>\n</xs:schema>\n',
+                 encoding="utf-8")
+    res = SA.apply(RUN, RUN, [
+        {"repo_id": RID, "path": "src/NET-Common.xsd", "kind": "edit",
+         "old_string": '<xs:enumeration value="BG"/>',
+         "new_string": '<xs:enumeration value="GP"/>'}])
+    assert res["applied"] and not res["failed"]
+    assert 'value="GP"' in p.read_text(encoding="utf-8")

@@ -71,3 +71,35 @@ def test_xsd_names_in_scrapes_file_tokens():
     names = xsd_names_in("touches ReqTransfer.xsd and `common_types.xsd`", "also b.xsd")
     assert names == {"ReqTransfer.xsd", "common_types.xsd", "b.xsd"}
     assert xsd_names_in("", None) == set()
+
+
+# ── B3: section-aware clipping ──────────────────────────────────────────────────────
+
+def test_clip_markdown_keeps_whole_sections_and_names_omissions():
+    doc = ("# Intro\nshort intro\n\n## Fields\n" + "f" * 300
+           + "\n\n## Regulatory\n" + "r" * 300 + "\n\n## Error Codes\n" + "e" * 300)
+    out = X._clip_markdown(doc, 400, "tech spec")
+    assert "short intro" in out and "fff" in out
+    assert "rrr" not in out and "eee" not in out          # whole sections dropped, not sliced
+    assert "clipped to fit" in out and "Regulatory" in out and "Error Codes" in out
+
+
+def test_clip_markdown_passthrough_and_headingless_fallback():
+    assert X._clip_markdown("tiny", 100, "x") == "tiny"
+    out = X._clip_markdown("n" * 500, 100, "BRD")          # no headings → hard clip + note
+    assert out.startswith("n" * 100) and "clipped to fit" in out
+
+
+# ── B4: structured REQUIRED/NOT-REQUIRED decision ───────────────────────────────────
+
+def test_decision_reads_the_decision_section_not_the_prose():
+    doc = ("## XSD Change Assessment\n\n### Decision\n**NOT REQUIRED**\n\n### Rationale\n"
+           "The spec adds a REQUIRED field, but it maps onto the existing schema.\n")
+    assert X.parse_xsd_decision(doc) is False              # prose "REQUIRED" must not flip it
+    assert X.parse_xsd_decision(doc.replace("**NOT REQUIRED**", "**REQUIRED**")) is True
+
+
+def test_decision_falls_back_to_legacy_heuristic_without_a_section():
+    assert X.parse_xsd_decision("free text saying **REQUIRED** changes") is True
+    assert X.parse_xsd_decision("NOT REQUIRED here, despite **REQUIRED** later") is False
+    assert X.parse_xsd_decision("") is False

@@ -989,6 +989,10 @@ def _xsd_diff_record(ctx: ContextPack, run_id: str, ops: list[FileOp]) -> dict:
         try:
             d = xsd_graph_builder.diff_schema(base, op.content or "")
             out[key] = {"new": d.new, "modified": d.modified, "deprecated": d.deprecated}
+            if d.lossy:
+                # B7 — a recovered (partial) parse makes NEW/DEPRECATED approximate;
+                # say so rather than presenting artifacts of the lost subtree as facts.
+                out[key]["parse_lossy"] = True
         except Exception as e:  # noqa: BLE001 — a diff hiccup must never terminate the run
             logger.warning("xsd diff failed for %s (recorded as base_unavailable): %s", key, e)
             out[key] = {"new": [], "modified": [], "deprecated": [], "base_unavailable": True}

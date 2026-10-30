@@ -88,3 +88,14 @@ def test_dependents_of_is_transitive():
                             {"path": "c.xsd", "content": c}])
     # a→b→c ; a change to c impacts both b and a
     assert dependents_of("c.xsd", edges) == {"a.xsd", "b.xsd"}
+
+
+def test_diff_marks_lossy_when_a_side_only_parses_via_recovery():
+    from app.agents.xsd_graph_builder import diff_schema, parse_is_lossy
+    ok = ('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">'
+          '<xs:element name="A" type="xs:string"/></xs:schema>')
+    broken = ok + "<dangling>"          # recoverable but lossy
+    assert parse_is_lossy(ok) is False and parse_is_lossy(broken) is True
+    assert parse_is_lossy("") is False  # no document ≠ lossy
+    assert diff_schema(ok, ok).lossy is False
+    assert diff_schema(ok, broken).lossy is True

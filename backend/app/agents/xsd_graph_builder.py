@@ -51,6 +51,20 @@ def _root(content: str, path: str = "<xsd>"):
     return root
 
 
+def parse_is_lossy(content: str) -> bool:
+    """True when the content only parses via recover=True (B7): the element index
+    built from it is PARTIAL, so index-derived facts (diffs, signatures) are
+    approximate for this schema. Blank/empty content is 'no document', not lossy."""
+    if not content or not content.strip():
+        return False
+    parser = etree.XMLParser(resolve_entities=False, recover=True)
+    try:
+        etree.fromstring(content.encode("utf-8"), parser=parser)
+    except Exception:  # noqa: BLE001 — unparseable even with recovery
+        return True
+    return bool(parser.error_log)
+
+
 # ── Parsed schema ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -169,6 +183,10 @@ class XsdDiff:
     new: list[str] = field(default_factory=list)
     modified: list[str] = field(default_factory=list)
     deprecated: list[str] = field(default_factory=list)
+    # B7 — True when either side only parsed via recover=True: the element index is
+    # then PARTIAL, so NEW/DEPRECATED entries may be artifacts of the lost subtree
+    # rather than real changes. Consumers must present such a diff as approximate.
+    lossy: bool = False
 
     def as_records(self) -> list[dict]:
         return (
@@ -188,7 +206,7 @@ def diff_schema(old_content: str, new_content: str) -> XsdDiff:
     diff. Use the diff and the graph together for full impact.
     """
     old, new = element_index(old_content), element_index(new_content)
-    diff = XsdDiff()
+    diff = XsdDiff(lossy=parse_is_lossy(old_content) or parse_is_lossy(new_content))
     for k, sig in new.items():
         if k not in old:
             diff.new.append(k)

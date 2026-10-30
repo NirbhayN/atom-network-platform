@@ -38,6 +38,22 @@ logger = logging.getLogger(__name__)
 _CONTEXT_LINES = 6
 
 
+def _can_apply(content: Optional[str], old: str, new: str) -> bool:
+    """Whether the tolerant replay (B9: the same whitespace-tolerant match ladder
+    edit_file uses) would land this amendment on `content` — the honest meaning of
+    'applicable' for the approval UI."""
+    if not content or not old:
+        return False
+    try:
+        from app.agents.agentic_edit import EditError, apply_edit
+        apply_edit(content, old, new)
+        return True
+    except EditError:
+        return False
+    except Exception:  # noqa: BLE001 — probe is advisory; never break describe
+        return False
+
+
 def _base_content(run_id: str, repo_id: str, base_sha: Optional[str], path: str) -> Optional[str]:
     """File content at the run's pinned base SHA, or None when it cannot be read."""
     if not base_sha:
@@ -134,7 +150,10 @@ def describe(run_id: str, workspace_run_id: str, repo_base_sha: dict,
                 h = _hunk(cur or "", old)
                 item["line"] = h["line"]
                 item["context"] = h["before"]
-                item["applicable"] = bool(cur and old and old in cur)
+                # Probe with the SAME ladder apply() uses, so "applicable" means
+                # "approval will actually land" — the exact-substring probe said
+                # False for edits the tolerant replay would in fact apply.
+                item["applicable"] = _can_apply(cur, old, item.get("new_string") or "")
                 if base is None:
                     item["origin"] = "unknown"
                 elif old and old in base:
@@ -192,15 +211,21 @@ def apply(run_id: str, workspace_run_id: str, amendments: list[dict]) -> dict:
                 continue
             content = target.read_text(encoding="utf-8", errors="replace")
             old, new = a.get("old_string") or "", a.get("new_string") or ""
-            if not old or old not in content:
-                failed.append({**a, "reason": "the text to replace is no longer present "
-                                              "(the file changed since the proposal was staged)"})
+            if not old:
+                failed.append({**a, "reason": "empty old_string"})
                 continue
-            if content.count(old) > 1:
-                failed.append({**a, "reason": f"the text to replace appears {content.count(old)}× — "
-                                              "ambiguous, not applied"})
+            # B9 — the same whitespace-tolerant match ladder the agent's own edit_file
+            # uses (exact → trailing-ws → indent → collapsed-ws, each with a
+            # single-match guard): a reformat between staging and approval no longer
+            # fails the replay, while ambiguity and absence still refuse loudly with
+            # the ladder's precise reason — never force-applied, never guessed.
+            from app.agents.agentic_edit import EditError, apply_edit
+            try:
+                new_content, _level = apply_edit(content, old, new)
+            except EditError as e:
+                failed.append({**a, "reason": str(e)})
                 continue
-            workspace_local.write_preserving_eol(target, content.replace(old, new, 1))
+            workspace_local.write_preserving_eol(target, new_content.replace("\r\n", "\n"))
             applied.append(a)
         except Exception as e:  # noqa: BLE001 — one bad amendment must not abort the rest
             logger.exception("schema-amendment apply failed for %s:%s", repo_id, path)

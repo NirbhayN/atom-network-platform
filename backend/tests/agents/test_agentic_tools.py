@@ -495,13 +495,18 @@ def test_xsd_facet_check_ignores_non_schema_files():
     assert T._xsd_facet_warnings("Foo.java", _SHIPPED) == ""
 
 
-def test_edit_file_surfaces_the_facet_warning(ws):
+def test_edit_file_blocks_an_introduced_facet_defect(ws):
+    # B6 hardened the old advisory ("the schema was written, fix these now") into a
+    # pre-write BLOCK for defects the edit itself introduces — disk stays untouched
+    # and the ToolError carries the same actionable guidance.
     ctx = _ctx()
     (ws / "s.xsd").write_text('<xs:schema>\n<xs:pattern value="[0-9]+"/>\n</xs:schema>\n')
     T.read_file(ctx, RID, "s.xsd")
-    out = T.edit_file(ctx, RID, "s.xsd", '<xs:pattern value="[0-9]+"/>',
-                      '<xs:pattern value="[0-9\\\\.]+"/>')
-    assert "edited s.xsd" in out and "LITERAL BACKSLASH" in out
+    with pytest.raises(T.ToolError) as e:
+        T.edit_file(ctx, RID, "s.xsd", '<xs:pattern value="[0-9]+"/>',
+                    '<xs:pattern value="[0-9\\\\.]+"/>')
+    assert "LITERAL BACKSLASH" in str(e.value)
+    assert 'value="[0-9]+"' in (ws / "s.xsd").read_text(), "disk untouched"
 
 
 # ── submit_plan validation: malformed file entries bounce with the issues ──────────
@@ -599,3 +604,49 @@ def test_created_file_reread_is_stubbed(ws):
     ctx = _ctx()
     T.create_file(ctx, RID, "src/B.java", "class B {}\n")
     assert "UNCHANGED" in T.read_file(ctx, RID, "src/B.java")
+
+
+# ── B6: blocking schema-write guard (well-formedness regression + introduced facets) ──
+
+_XSD_OK = ('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n'
+           '  <xs:simpleType name="Code"><xs:restriction base="xs:string">\n'
+           '    <xs:pattern value="[A-Z]{2}"/></xs:restriction></xs:simpleType>\n'
+           '</xs:schema>\n')
+
+
+def test_create_file_rejects_malformed_xsd(ws):
+    ctx = _ctx()
+    with pytest.raises(T.ToolError) as e:
+        T.create_file(ctx, RID, "src/new.xsd", "<xs:schema><unclosed>")
+    assert "NOT WELL-FORMED" in str(e.value)
+    assert not (ws / "src" / "new.xsd").exists(), "nothing lands on disk"
+
+
+def test_create_file_rejects_introduced_facet_defect(ws):
+    ctx = _ctx()
+    bad = _XSD_OK.replace('value="[A-Z]{2}"', r'value="[A-Z"')   # non-compiling regex
+    with pytest.raises(T.ToolError) as e:
+        T.create_file(ctx, RID, "src/new.xsd", bad)
+    assert "facet defect" in str(e.value)
+
+
+def test_edit_rejects_wellformedness_regression_but_allows_clean_edits(ws):
+    ctx = _ctx()
+    (ws / "src" / "s.xsd").write_text(_XSD_OK)
+    T.read_file(ctx, RID, "src/s.xsd")
+    with pytest.raises(T.ToolError) as e:
+        T.edit_file(ctx, RID, "src/s.xsd", old_string="</xs:schema>", new_string="<broken></xs:schema>")
+    assert "NOT WELL-FORMED" in str(e.value)
+    assert "<broken>" not in (ws / "src" / "s.xsd").read_text(), "disk untouched"
+    out = T.edit_file(ctx, RID, "src/s.xsd", old_string='value="[A-Z]{2}"', new_string='value="[A-Z]{3}"')
+    assert out.startswith("edited ")
+
+
+def test_edit_preexisting_facet_defect_stays_advisory(ws):
+    # A legacy pattern with a defect the agent did NOT touch must not wedge the edit.
+    legacy = _XSD_OK.replace('value="[A-Z]{2}"', r'value="a\\.b"')  # literal-backslash defect
+    (ws / "src" / "legacy.xsd").write_text(legacy)
+    ctx = _ctx()
+    T.read_file(ctx, RID, "src/legacy.xsd")
+    out = T.edit_file(ctx, RID, "src/legacy.xsd", old_string='name="Code"', new_string='name="Kode"')
+    assert out.startswith("edited ") and "facet check" in out      # advisory note, not a block

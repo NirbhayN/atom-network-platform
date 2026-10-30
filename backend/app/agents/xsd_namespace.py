@@ -28,15 +28,25 @@ reuse-matching see through it.
 """
 from __future__ import annotations
 
+import re
 from functools import lru_cache
+
+_URL_NS_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)(://)([^/]+)(.*)$")
 
 
 def _normalize(ns: str | None) -> str:
-    """Conservative, matching-safe normalization: trim whitespace + a single
-    trailing slash. Deliberately does NOT touch scheme or host — host differences
-    (``example.org`` vs ``example.net``) are genuine and handled by the explicit
-    pack-declared group map, never by guessing."""
-    return (ns or "").strip().rstrip("/")
+    """Conservative, matching-safe normalization: trim whitespace, a single trailing
+    slash, and lowercase the scheme + host of URL-form namespaces (B8 — per RFC 3986
+    those parts are case-INSENSITIVE, so ``HTTP://Example.Org/ns`` and
+    ``http://example.org/ns`` denote the same authority; the PATH stays
+    case-sensitive). Deliberately does NOT unify different hosts or schemes
+    (``http`` vs ``https``, ``example.org`` vs ``example.net``) — those are genuine
+    identity differences, handled only by the explicit pack-declared group map."""
+    s = (ns or "").strip().rstrip("/")
+    m = _URL_NS_RE.match(s)
+    if m:
+        s = m.group(1).lower() + m.group(2) + m.group(3).lower() + m.group(4)
+    return s
 
 
 @lru_cache(maxsize=4)

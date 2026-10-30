@@ -53,17 +53,30 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
    `xsd_compile_repair_rounds` (2) full re-emissions; residual errors surface in
    the done payload/job result, never silently ship. `retry_allowed` flipped to
    True on the TECH_SPEC_TO_XSD checkpoint (a retry is now compiler-checked).
-3. ⬜ Kill hard truncations: `tech_spec[:4000]`, `brd[:2000]` (xsd.py),
-   `source_xsd[:8000]` (TSD writer) → section-aware selection + log when clipped.
-4. ⬜ Structured REQUIRED/NOT-REQUIRED decision (replace `"**REQUIRED**" in text`).
-5. ⬜ `xsd_bundle` filename attribution: structured per-file output instead of the
-   last-`.xsd`-token-in-600-chars regex — mislabeled blocks ship to partners.
-6. ⬜ Promote the over-escaped `xs:pattern` facet warning to blocking once B2 exists.
-7. ⬜ Minor: `recover=True` lxml parsing can yield partial element indexes →
-   spurious NEW/DEPRECATED diffs (flag loudly).
-8. ⬜ Minor: `xsd_namespace` reuse misses undeclared namespace spelling variants.
-9. ⬜ Minor: `schema_amendment.apply` exact-match anchors — moved text surfaces as
-   `failed`; consider the edit-ladder used by `agentic_edit`.
+3. ✅ Truncations killed: spec/BRD get section-aware clipping (whole sections kept,
+   omitted headings NAMED in the prompt + logged; caps 16K/8K configurable); the
+   TSD writer's `source_xsd[:8000]` is now a 24K head+tail clip with a loud
+   "treat the schema set as INCOMPLETE" marker.
+4. ✅ Structured decision: `parse_xsd_decision` reads the assessment's `### Decision`
+   section (prose like "a REQUIRED field" can no longer flip the verdict); legacy
+   whole-document heuristic kept as a logged fallback.
+5. ✅ Filename attribution: extraction scoped to the inter-block region (a filename
+   in the previous section's prose can't claim the next block), re-emitted files
+   last-body-wins, and the generation prompt now mandates the per-file heading
+   because "the platform ships files by that heading".
+6. ✅ Blocking schema-write guard (`_xsd_write_guard`): an edit that INTRODUCES an
+   xs:pattern facet defect, or turns a well-formed .xsd/.xjb into broken XML,
+   rejects BEFORE the write with the fix in the error. Pre-existing defects in
+   untouched patterns stay advisory (never wedged on legacy content);
+   `agentic_xsd_facet_block` to disable the facet tier.
+7. ✅ Lossy-parse flagging: `XsdDiff.lossy` + `parse_is_lossy` — a diff built from a
+   recovered (partial) parse is marked `parse_lossy` where consumed, so spurious
+   NEW/DEPRECATED read as approximate, not fact.
+8. ✅ Namespace matching: scheme+host lowercased per RFC 3986 (path stays
+   case-sensitive); different hosts/schemes remain pack-declared only.
+9. ✅ `schema_amendment.apply` + `describe.applicable` use the same whitespace-
+   tolerant edit ladder as `edit_file` — a reformat between staging and approval
+   no longer fails the replay; ambiguity/absence still refuse loudly.
 
 ## C. Phase B review/verification hygiene
 
@@ -117,3 +130,7 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
   invariants (brief + assistant reasoning never evicted) pinned by tests.
 - Scout subagent (pillar A4): `scout` tool in the code phase — isolated read-only
   child loop answers one research question; only the brief returns.
+- XSD section complete (B1–B9): base-schema grounding + compile/repair loop,
+  section-aware prompt clipping, structured decision parse, scoped filename
+  attribution, blocking schema-write guard, lossy-parse flags, RFC-correct
+  namespace matching, edit-ladder amendment replay.

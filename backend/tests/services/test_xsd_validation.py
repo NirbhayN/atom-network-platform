@@ -145,3 +145,29 @@ def test_mixed_doc_reports_only_the_broken_file():
     errs = compile_generated_schemas(_doc(("good.xsd", _OK_SCHEMA),
                                           ("bad.xsd", "<xs:schema><oops>")))
     assert len(errs) == 1 and errs[0].startswith("bad.xsd")
+
+
+# ── B5: extract_xsd_blocks attribution scoping ──────────────────────────────────────
+
+def test_extract_scopes_filename_to_the_inter_block_region():
+    from app.services.xsd_bundle import extract_xsd_blocks
+    md = ("### `first.xsd`\n```xml\n<a/>\n```\n"
+          "This section discusses `mentioned.xsd` consumers at length.\n"
+          "### `second.xsd`\n```xml\n<b/>\n```\n")
+    blocks = extract_xsd_blocks(md)
+    assert [f for f, _ in blocks] == ["first.xsd", "second.xsd"]
+
+
+def test_extract_unnamed_block_gets_positional_name():
+    from app.services.xsd_bundle import extract_xsd_blocks
+    blocks = extract_xsd_blocks("intro\n```xml\n<a/>\n```")
+    assert blocks == [("xsd_part_1.xsd", "<a/>")]
+
+
+def test_extract_reemitted_file_last_body_wins():
+    from app.services.xsd_bundle import extract_xsd_blocks
+    md = ("### `dup.xsd`\n```xml\n<old/>\n```\n"
+          "### `other.xsd`\n```xml\n<o/>\n```\n"
+          "Corrected version:\n### `dup.xsd`\n```xml\n<fixed/>\n```\n")
+    blocks = extract_xsd_blocks(md)
+    assert blocks == [("dup.xsd", "<fixed/>"), ("other.xsd", "<o/>")]

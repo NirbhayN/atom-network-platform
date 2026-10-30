@@ -83,3 +83,11 @@ def test_pack_without_groups_matches_raw_strings(nlln_pack):
     assert not same_namespace(CANON, VARIANT)
     assert namespace_variant_note(VARIANT) is None
     assert sibling_namespace_spellings(VARIANT) == [VARIANT.rstrip("/")]
+
+
+def test_normalize_lowercases_scheme_and_host_only():
+    # RFC 3986: scheme + host are case-insensitive; the path is NOT.
+    from app.agents.xsd_namespace import _normalize
+    assert _normalize("HTTP://Example.Org/NS/Path") == "http://example.org/NS/Path"
+    assert _normalize("http://example.org/ns/") == "http://example.org/ns"
+    assert _normalize("urn:ecosystem:Pay") == "urn:ecosystem:Pay"   # non-URL untouched

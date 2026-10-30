@@ -27,6 +27,10 @@ For each affected schema, output the complete updated XSD:
 </xs:schema>
 ```
 
+Name EVERY file in a `### `<filename>.xsd`` heading placed IMMEDIATELY above its
+```xml block — the platform extracts, packages and ships files to partners by that
+heading, so an unnamed or mislabeled block ships under the wrong filename.
+
 ## Migration Notes
 - Steps to deploy the updated XSD to the {{AUTHORITY}} schema registry
 - Version bump strategy (e.g. namespace version increment)

@@ -839,6 +839,18 @@ class Settings(BaseSettings):
     # result still reports).
     xsd_generation_schema_context_chars: int = 40_000
     xsd_compile_repair_rounds: int = 2
+    # B3 — section-aware prompt budgets for the XSD doc path (whole markdown sections
+    # kept in order; omissions are NAMED in the prompt and logged — never a silent
+    # mid-sentence slice). tsd_source_xsd_chars bounds the TSD writer's source_xsd
+    # injection the same way (head+tail with a loud marker when over).
+    xsd_prompt_tech_spec_chars: int = 16_000
+    xsd_prompt_brd_chars: int = 8_000
+    tsd_source_xsd_chars: int = 24_000
+    # B6 — block a schema write that INTRODUCES an xs:pattern facet defect
+    # (over-escaped backslash / non-compiling regex). Pre-existing defects in
+    # untouched patterns stay advisory; the well-formedness regression check is
+    # always on (deterministic, zero false positives).
+    agentic_xsd_facet_block: bool = True
     # S10 — verification (§9). Comma-separated Maven modules whose compile errors
     # are SOFT-failed — but ONLY when the module is untouched and out-of-scope; a
     # change that edits it is gated normally (§9.2). EMPTY by default: verification

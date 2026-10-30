@@ -592,15 +592,15 @@ def _edit_echo(new_content: str, new_string: str) -> str:
 _XSD_PATTERN_RE = re.compile(r"<(?:\w+:)?pattern\b[^>]*\bvalue=\"([^\"]*)\"", re.I)
 
 
-def _xsd_facet_warnings(path: str, text: str) -> str:
+def _xsd_facet_findings(path: str, text: str) -> list[str]:
     """Sanity-check xs:pattern facets on a schema write. A pattern reaches the file through a
     JSON tool argument, so it crosses two escaping layers; doubling a backslash once too often
     turns `\\.` (escaped dot) into `\\\\` — a LITERAL BACKSLASH — which silently WIDENS the
     allowed character set. The result is valid XSD, valid XML and builds clean, so nothing else
     in this phase notices: schema_guardian only answers reuse-vs-create and there is no compile
-    of the facet itself. Advisory only — returns '' when the facets look sane."""
+    of the facet itself. Returns one finding string per suspect pattern ([] = sane)."""
     if not path.lower().endswith(".xsd"):
-        return ""
+        return []
     from xml.sax.saxutils import unescape
     out: list[str] = []
     for raw in _XSD_PATTERN_RE.findall(text):
@@ -617,10 +617,55 @@ def _xsd_facet_warnings(path: str, text: str) -> str:
         except re.error as e:
             out.append(f'pattern "{pat}" does not compile as a regex ({e}) — check it for a '
                        "stray bracket, quantifier or escape.")
+    return out
+
+
+def _xsd_facet_warnings(path: str, text: str) -> str:
+    """Advisory rendering of :func:`_xsd_facet_findings` (pre-existing defects only —
+    introduced ones are BLOCKED before the write, see ``_xsd_write_guard``)."""
+    out = _xsd_facet_findings(path, text)
     if not out:
         return ""
     return "\n⚠ XSD facet check — the schema was written, fix these now:\n" + "\n".join(
         f"  - {w}" for w in out)
+
+
+def _xml_parses_ok(text: str) -> bool:
+    """Strict stdlib well-formedness probe (no external entities are fetched)."""
+    import xml.etree.ElementTree as ET
+    try:
+        ET.fromstring(text)
+        return True
+    except Exception:  # noqa: BLE001 — any parse failure counts as not-well-formed
+        return False
+
+
+def _xsd_write_guard(path: str, old_text: str | None, new_text: str) -> None:
+    """BLOCKING schema-write checks (B6) — the agentic twin of the doc path's compile
+    gate. Raises ToolError BEFORE the write lands when THIS edit:
+
+    * turns a previously well-formed .xsd/.xjb into non-well-formed XML (clean→broken
+      regression only — a file that already didn't parse is never the agent's to fix), or
+    * INTRODUCES an xs:pattern facet defect (over-escaped backslash / non-compiling
+      regex). Pre-existing defects in untouched patterns stay advisory, so the agent
+      is never wedged on legacy content it must not touch.
+
+    Deterministic; disable the facet tier with agentic_xsd_facet_block=False."""
+    if not path.lower().endswith((".xsd", ".xjb")):
+        return
+    if (old_text is None or _xml_parses_ok(old_text)) and not _xml_parses_ok(new_text):
+        raise ToolError(f"edit rejected — it makes {path} NOT WELL-FORMED XML (unclosed tag, "
+                        "bad nesting or a stray character). Re-read the surrounding lines and "
+                        "emit a corrected, complete edit; the file on disk is untouched.")
+    from app.core.config import settings as _s
+    if not getattr(_s, "agentic_xsd_facet_block", True):
+        return
+    prior = set(_xsd_facet_findings(path, old_text or ""))
+    introduced = [w for w in _xsd_facet_findings(path, new_text) if w not in prior]
+    if introduced:
+        raise ToolError("edit rejected — it INTRODUCES xs:pattern facet defect(s); the file on "
+                        "disk is untouched. Fix the pattern(s) and re-issue the edit:\n- "
+                        + "\n- ".join(introduced))
 
 
 def edit_file(ctx: RunContext, repo_id: str, path: str,
@@ -670,6 +715,9 @@ def edit_file(ctx: RunContext, repo_id: str, path: str,
         raise ToolError(f"edit rejected — it introduces a Java syntax error in {path} (unbalanced "
                         "braces or an incomplete statement). Re-read the surrounding lines and emit "
                         "a corrected, syntactically-complete edit.")
+    # Blocking schema checks (B6): well-formedness regression + introduced facet
+    # defects reject BEFORE the write — disk untouched, error feeds the loop.
+    _xsd_write_guard(path, content, new_content)
     # Match the file's existing dominant EOL: writing LF onto a CRLF source rewrites
     # every line of the diff and drowns the actual edit (−24,789/+24,890 on a 25K-line
     # file for a small change). Detection reads the CURRENT (pre-write) bytes.
@@ -696,8 +744,11 @@ def create_file(ctx: RunContext, repo_id: str, path: str, content: str) -> str:
         return staged
     if target.exists():
         raise ToolError(f"{path} already exists — use edit_file")
-    target.parent.mkdir(parents=True, exist_ok=True)
     content = content.replace("\r\n", "\n")   # keep disk + hashes LF-consistent with readers
+    # Blocking schema checks (B6): a NEW schema file must be well-formed and every
+    # facet is "introduced" by definition — reject before anything lands on disk.
+    _xsd_write_guard(path, None, content)
+    target.parent.mkdir(parents=True, exist_ok=True)
     workspace_local.write_preserving_eol(target, content)
     ctx.read_files.add((repo_id, path))      # a file you just wrote is "known"
     ctx.full_reads.add((repo_id, path))      # …in FULL: you authored every line of it

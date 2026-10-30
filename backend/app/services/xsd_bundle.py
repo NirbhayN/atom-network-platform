@@ -25,17 +25,29 @@ def extract_xsd_blocks(markdown: str) -> list[tuple[str, str]]:
     """Pull out every ```xml block in `markdown`. Returns a list of
     `(filename, xml_body)` tuples in document order.
 
-    Schema filenames typically appear in a heading like
-        1. **`network-annotations.xsd`** — New schema defining ...
-    so we take the last `<name>.xsd` token in the ~600 chars before each block;
-    positional fallback (`xsd_part_<n>.xsd`) when the agent didn't name it.
+    Schema filenames appear in a heading like
+        ### `network-annotations.xsd`
+    so we take the last `<name>.xsd` token BETWEEN the previous block's end and this
+    block's start (still capped at ~600 chars) — scoping to the inter-block region
+    stops a filename mentioned in the PREVIOUS section's prose ("regenerate X.xsd
+    consumers") from claiming the next block. Positional fallback (`xsd_part_<n>.xsd`)
+    when the agent didn't name it. A filename emitted twice (e.g. a corrected
+    re-emission in the same document) keeps its position with the LAST body winning —
+    shipping two bodies under one name made the zip an accident of iteration order.
     """
     md = markdown or ""
     out: list[tuple[str, str]] = []
+    index_of: dict[str, int] = {}
+    prev_end = 0
     for i, m in enumerate(_XML_FENCE_RE.finditer(md), start=1):
         body = m.group("body").strip()
-        prefix = md[max(0, m.start() - 600): m.start()]
+        prefix = md[max(prev_end, m.start() - 600): m.start()]
+        prev_end = m.end()
         names = _XSD_FILENAME_RE.findall(prefix)
         fname = names[-1] if names else f"xsd_part_{i}.xsd"
-        out.append((fname, body))
+        if fname in index_of:
+            out[index_of[fname]] = (fname, body)      # last emission wins
+        else:
+            index_of[fname] = len(out)
+            out.append((fname, body))
     return out

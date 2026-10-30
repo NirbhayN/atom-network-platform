@@ -1440,6 +1440,20 @@ def _write_section(
     # the feature_prompt[:3000] slice that would otherwise drop it.
     xsd_chunk = ""
     if source_xsd:
+        # B3 — the silent `[:8000]` slice cut mid-element and dropped whole schemas from
+        # multi-file changes with no trace. Budget raised + head+tail clip with a LOUD
+        # marker so the model (and the log) know exactly that/where content was omitted.
+        from app.core.config import settings as _cfg
+        _cap = int(getattr(_cfg, "tsd_source_xsd_chars", 24_000))
+        _src = source_xsd
+        if len(_src) > _cap:
+            logger.warning("TSD prompt: source_xsd clipped %d → %d chars", len(_src), _cap)
+            _head, _tail = (_cap * 2) // 3, _cap // 3
+            _src = (_src[:_head]
+                    + f"\n…[source XSD clipped — {len(source_xsd) - _cap} chars omitted here; "
+                      "treat the schema set as INCOMPLETE and do not assume absent elements "
+                      "don't exist]…\n"
+                    + _src[-_tail:])
         xsd_chunk = (
             "REALIZED XSD SCHEMA CHANGE (AUTHORITATIVE — this is what was ACTUALLY schema-modeled "
             "for THIS change; reproduce these real element/field/namespace names EXACTLY and do NOT "
@@ -1448,7 +1462,7 @@ def _write_section(
             "types, or services that are absent from this schema as if they are being built; if the "
             "broader feature implies them, label them explicitly as future/out-of-scope, not as part "
             "of this change:\n"
-            f"{source_xsd[:8000]}\n"
+            f"{_src}\n"
         )
 
     # Ratified code-grounded technical design (classes/methods/keys/codes). Injected directly
