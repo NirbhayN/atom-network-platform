@@ -1023,20 +1023,29 @@ def run_plan(db, run_id: str, plan: list[VerificationStep], *, touched_modules: 
                 logger.warning("verify: run=%s step %d/%d kind=%s TIMED OUT", run_id, i + 1, len(plan), step.kind)
                 gates["timeout"] = False
             gate_pass, hard, soft, step_env_reason, _req_java = _step_gate(step, res, effective_soft, skip_patterns)
-            # JDK-mismatch retry: a hard build failure whose failing module declares a
+            # JDK-mismatch retry: a build failure whose failing module declares a
             # DIFFERENT Java major than the JVM the step ran on (the mixed-major
             # reactor case) is rebuilt per-module with the matching installed JDK —
-            # a legacy Java-8 module gets BUILT, not skipped. A clean retry lifts the
-            # step out of the failure verdict; anything else leaves it untouched.
+            # a legacy Java-8 module gets BUILT, not skipped. This runs BEFORE any
+            # soft-fail exclusion takes effect: a step that only "passed" because a
+            # soft-listed module's errors were excluded still attempts the rescue,
+            # so the exclusion is the fallback, never the first answer. A clean
+            # retry lifts the step out of the failure verdict (or turns an excluded
+            # module into a genuinely built one); anything else changes nothing.
             _retry_notes: list[str] = []
-            if (not gate_pass and not res.timed_out and not step_env_reason
-                    and step.kind in ("generate_sources", "install", "compile")):
+            _failed_build = (not gate_pass and not res.timed_out and not step_env_reason
+                             and step.kind in ("generate_sources", "install", "compile"))
+            _soft_passed = (gate_pass and res.exit_code != 0 and soft > 0
+                            and step.kind in ("generate_sources", "install", "compile"))
+            if _failed_build or _soft_passed:
                 _full0 = (res.stdout or "") + "\n" + (res.stderr or "")
                 _retry_ok, _retry_notes = _retry_with_module_jdk(
                     run_id, step, _diagnostic_lines(_full0, step), _jvm_used(_ov_major),
                     executor, vlog)
                 if _retry_ok:
                     gate_pass, hard, soft = True, 0, 0
+                elif _soft_passed:
+                    _retry_notes = []   # rescue didn't apply — keep the plain soft-pass
             if step.kind in ("generate_sources", "install", "compile") and not gate_pass:
                 gates["compile"] = False
             elif step.kind == "test" and not gate_pass:

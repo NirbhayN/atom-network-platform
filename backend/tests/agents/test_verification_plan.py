@@ -774,3 +774,40 @@ def test_retry_tolerates_executors_without_env_overrides(monkeypatch, tmp_path):
     out = run_plan(None, RUN, [_step()], touched_modules=set(), soft_fail_modules=set(),
                    executor=_Exec(lambda a: _res(1, stdout=fail)))
     assert out.status == "needs_fix" and out.gates["compile"] is False
+
+
+def _module_attributed_fail(repo, module):
+    # Soft-fail attribution needs the module markers in the reactor log, not just
+    # a bare [ERROR] path line.
+    return (f"[INFO] Building {module} 1.0\n"
+            f"[INFO] --- maven-compiler-plugin:3.11:compile (default) @ {module} ---\n"
+            f"[ERROR] {repo}/{module}/src/Bar.java:[5,1] incompatible types\n"
+            "[INFO] BUILD FAILURE\n")
+
+
+def test_soft_listed_module_is_rescued_not_excluded(monkeypatch, tmp_path):
+    # A module on the soft list that fails on a JDK mismatch must be BUILT by the
+    # rescue, not merely excluded — soft-fail is the fallback, never the first answer.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8,))
+    ex = _EnvExec(_module_attributed_fail(repo, "legacy-igw"))
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules={"legacy-igw"}, executor=ex)
+    assert out.status == "verified"
+    notes = out.module_results["core (full build)"]["errors"]
+    assert notes and "JDK 8" in notes[0], "rescued (built), not silently excluded"
+    assert any(c[1] == {"JAVA_HOME": "/fake/jdk8"} for c in ex.calls)
+
+
+def test_soft_exclusion_still_covers_a_genuinely_broken_module(monkeypatch, tmp_path):
+    # Right JDK, still red (rotten legacy code): the soft exclusion keeps an
+    # UNTOUCHED out-of-scope module from condemning the run — the operator's
+    # last-resort escape hatch, applied only after the rescue failed.
+    repo = _mixed_repo(tmp_path)
+    _patch_jdk_env(monkeypatch, repo, installed=(8,))
+    ex = _EnvExec(_module_attributed_fail(repo, "legacy-igw"), stubborn=True)
+    out = run_plan(None, RUN, [_step()], touched_modules=set(),
+                   soft_fail_modules={"legacy-igw"}, executor=ex)
+    assert out.status == "verified" and out.gates["compile"] is True
+    assert any(c[1] for c in ex.calls), "the rescue was attempted first"
+    assert out.module_results["core (full build)"]["errors"] == [], "plain soft-pass"

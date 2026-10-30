@@ -823,9 +823,15 @@ class Settings(BaseSettings):
     # the "needs confirmation" list and NEVER presented as definite.
     xsd_link_min_confidence: float = 0.55
     # S10 — verification (§9). Comma-separated Maven modules whose compile errors
-    # are SOFT-failed (legacy Java-8 IGW) — but ONLY when the module is untouched
-    # and out-of-scope; a change that edits it is gated normally (§9.2).
-    agentic_soft_fail_modules: str = "IGW"
+    # are SOFT-failed — but ONLY when the module is untouched and out-of-scope; a
+    # change that edits it is gated normally (§9.2). EMPTY by default: verification
+    # now builds MODULE-WISE with the JDK each module's own pom declares (legacy
+    # "1.8" ≡ "8") and rescues mixed-major reactors per module, so a legacy module
+    # no longer needs a standing exemption. List a module here only as a last
+    # resort when it cannot build even on its own declared JDK — and even then the
+    # JDK rescue runs FIRST, so a listed module is excluded only when a genuine
+    # non-toolchain failure remains.
+    agentic_soft_fail_modules: str = ""
     # S11 — Anthropic review (§10). Blocking findings loop back to code-change at
     # most this many rounds, then a human adjudicates. ACCURACY-FIRST: the loop EXITS the moment
     # the review is clean (no blocking findings), so this only binds a run that keeps needing
