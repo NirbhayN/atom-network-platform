@@ -334,3 +334,81 @@ def test_scout_without_question_bounces(ws, monkeypatch):
         run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go", db=None))
     assert res.stopped == "completed"
     assert "scout needs a `question`" in str(cap["messages"][-1])
+
+
+# ── G1: mid-run operator steering ───────────────────────────────────────────────────
+
+def test_append_user_text_folds_into_trailing_user_turn():
+    msgs = [{"role": "user", "content": "brief"}]
+    R._append_user_text(msgs, "steer!")
+    assert len(msgs) == 1 and "steer!" in msgs[0]["content"]
+    msgs = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}]
+    R._append_user_text(msgs, "steer!")
+    assert msgs[0]["content"][-1] == {"type": "text", "text": "steer!"}
+    msgs = [{"role": "assistant", "content": "done?"}]
+    R._append_user_text(msgs, "steer!")
+    assert msgs[-1] == {"role": "user", "content": "steer!"}
+
+
+def test_pending_steers_are_exactly_once():
+    from types import SimpleNamespace
+
+    class _Q:
+        def __init__(self, rows): self._rows = rows
+        def filter(self, *a, **k): return self
+        def order_by(self, *a): return self
+        def all(self): return self._rows
+    rows = [(1, "steer_request", {"message": "use the existing RefundService"}),
+            (2, "steer_injected", {"source_seq": 1}),
+            (3, "steer_request", {"message": "add a negative-path test"}),
+            (4, "steer_request", {"message": "   "})]          # blank → never injected
+    db = SimpleNamespace(query=lambda *a: _Q(rows))
+    assert R._pending_steers(db, "r1") == [(3, "add a negative-path test")]
+
+
+def test_steering_is_injected_as_binding_user_turn_and_acked(ws, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_pending(db, run_id):
+        calls["n"] += 1
+        return [(7, "Reuse RefundService — do NOT create a new class")] if calls["n"] == 1 else []
+    monkeypatch.setattr(R, "_pending_steers", fake_pending)
+    events = []
+    monkeypatch.setattr(R, "emit_event",
+                        lambda db, run_id, kind, payload: events.append((kind, payload)))
+    captured = {}
+
+    async def fake(**kwargs):
+        import copy
+        # Deep-copy: the loop MUTATES the live list after the call; we assert on the
+        # exact request each call actually saw.
+        captured.setdefault("msgs", []).append(copy.deepcopy(kwargs.get("messages")))
+        t = fake.script[fake.i]; fake.i += 1
+        return t
+    fake.i = 0
+    fake.script = [
+        _turn([ToolUseRequest("t1", "submit_plan", {"summary": "x"})]),
+        _turn([], text="done", stop="end_turn"),
+    ]
+    monkeypatch.setattr(R, "call_messages_api_tools", fake)
+    res = asyncio.run(R.run_agent_loop(
+        run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go", db=object()))
+    assert res.stopped == "completed"
+    first = captured["msgs"][0]
+    assert first[-1]["role"] == "user" and "OPERATOR STEERING" in str(first[-1])
+    assert "Reuse RefundService" in str(first[-1])
+    roles = [m["role"] for m in captured["msgs"][-1]]
+    assert all(a != b for a, b in zip(roles, roles[1:])), "role alternation must stay valid"
+    acks = [p for k, p in events if k == "steer_injected"]
+    assert acks and acks[0]["source_seq"] == 7
+
+
+def test_scout_children_never_drain_steers(ws, monkeypatch):
+    seen = []
+    monkeypatch.setattr(R, "_pending_steers", lambda db, rid: seen.append(rid) or [])
+    monkeypatch.setattr(R, "emit_event", lambda *a, **k: None)   # sentinel db below
+    _script_runner(monkeypatch, [_turn([], text="brief", stop="end_turn")])
+    asyncio.run(R.run_agent_loop(
+        run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="q",
+        db=object(), agent_name="code_change:scout", require_plan=False))
+    assert seen == [], "a steer aimed at the run must wait for the MAIN loop"

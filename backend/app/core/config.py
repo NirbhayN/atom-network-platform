@@ -974,6 +974,12 @@ class Settings(BaseSettings):
     # that already trust the agent with repo writes and accept that posture.
     agentic_scratch_enabled: bool = False
     agentic_scratch_timeout_s: int = 60
+    # G1 — mid-run operator steering: POST /api/agentic/runs/{id}/steer queues a
+    # binding message the LIVE loop injects as a user turn at its next iteration and
+    # acks durably (steer_request/steer_injected events are the cross-process bus).
+    # The Claude-Code interaction property: corrections cost seconds, not a
+    # park → decide → resume cycle. Scout children never drain steers.
+    agentic_steering_enabled: bool = True
     # Modules to EXCLUDE from the verification verdict — comma-separated wildcard
     # patterns (`*` = any chars, matched case-insensitively against the Maven module
     # name and the failing line). A build failure attributable to a matching module —

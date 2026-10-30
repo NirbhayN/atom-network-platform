@@ -2547,6 +2547,32 @@ def get_walkthrough(run_id: str, db: DbDep, current_user: CurrentUser):
     return {"run_id": run_id, "generated": bool(wt), "walkthrough": wt or None}
 
 
+@router.post("/agentic/runs/{run_id}/steer")
+def steer_run(run_id: str, body: dict, db: DbDep, current_user: CurrentUser):
+    """G1 — talk to a RUNNING agent. Queues a binding operator message that the live
+    loop injects as a user turn at its next iteration (seconds, not a park/decide/
+    resume cycle) and acknowledges via a ``steer_injected`` event. The whole
+    exchange lives in the run's event feed."""
+    run = _run_or_404(db, run_id)
+    _authz_write(run, current_user)
+    msg = str((body or {}).get("message") or "").strip()
+    if not msg:
+        raise HTTPException(400, "message is required")
+    if len(msg) > 2000:
+        raise HTTPException(400, "message too long (≤2000 chars) — steering is a course "
+                                 "correction, not a spec; put large content in the docs")
+    if run.status != "active":
+        raise HTTPException(409, f"run is {run.status} — steering reaches a LIVE loop; "
+                                 "use the resume/decision flows for a parked run")
+    from app.agents.agentic_events import emit_event
+    emit_event(db, run.id, "steer_request",
+               {"message": msg, "by": getattr(current_user, "username", None),
+                "action": "🧭 Operator steering queued — applies at the agent's next turn: "
+                          + msg[:160]})
+    db.commit()
+    return {"queued": True, "run_id": run_id}
+
+
 @router.post("/agentic/runs/{run_id}/revert-round/{label}")
 def revert_round(run_id: str, label: str, db: DbDep, current_user: CurrentUser):
     """G6 — turn-level rewind: restore every repo worktree to the checkpoint taken

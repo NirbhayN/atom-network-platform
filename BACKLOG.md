@@ -154,10 +154,13 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 
 ## F. Claude-parity gaps (second audit, 2026-10-30)
 
-1. ⬜ **Mid-run steering** — the one deliberately left open: no channel to talk to a
-   RUNNING agent (corrections cost a park/decide/resume cycle). Build: a `steer`
-   endpoint queuing an operator message, drained at the next loop iteration as a
-   binding user turn; also lets ask_decision answers arrive without parking.
+1. ✅ **Mid-run steering** — `POST /api/agentic/runs/{id}/steer` queues a binding
+   operator message; the LIVE loop drains it at its next iteration as a user turn
+   (role-fold safe) and acks durably — corrections cost seconds, not a
+   park → decide → resume cycle. The committed event stream is the cross-process
+   bus (`steer_request`/`steer_injected` with source_seq → exactly-once, survives
+   pauses/resumes, whole exchange visible in the event feed). Scout children never
+   drain; `agentic_steering_enabled` to disable.
 2. ✅ Cross-run lessons memory: at COMPLETED, one bounded UTILITY-tier LLM call
    distills the run's durable repo-general gotchas into `AGENT_LESSONS.md` rows
    (RepoPathContext — no migration), deduped + capped FIFO, operator-editable;

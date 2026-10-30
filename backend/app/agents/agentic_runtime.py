@@ -301,6 +301,44 @@ def _run_tool_hook(stage: str, *, run_id: str, agent: str, iteration: int,
     return None
 
 
+def _append_user_text(messages: list[dict], text: str) -> None:
+    """Fold ``text`` into the trailing user turn so role alternation stays valid
+    (the API 400s on consecutive user messages); append a fresh user turn only
+    when the tail isn't one."""
+    if messages and messages[-1].get("role") == "user":
+        c = messages[-1].get("content")
+        if isinstance(c, list):
+            messages[-1] = {"role": "user", "content": c + [{"type": "text", "text": text}]}
+        else:
+            messages[-1] = {"role": "user", "content": f"{c}\n\n{text}"}
+    else:
+        messages.append({"role": "user", "content": text})
+
+
+def _pending_steers(db, run_id: str) -> list[tuple[int, str]]:
+    """G1 — undrained operator steering messages, oldest first. The committed event
+    stream is the cross-process bus: the API appends ``steer_request``, the live
+    loop injects it as a binding user turn and acks with ``steer_injected``
+    (carrying source_seq) — so a steer is applied exactly once, survives pauses and
+    resumes, and the whole exchange is visible in the run's event feed. Fail-open:
+    steering is a bonus channel, never a breaker."""
+    try:
+        from app.models.agentic import AgenticEvent
+        rows = (db.query(AgenticEvent.seq, AgenticEvent.kind, AgenticEvent.payload)
+                .filter(AgenticEvent.run_id == run_id,
+                        AgenticEvent.kind.in_(("steer_request", "steer_injected")))
+                .order_by(AgenticEvent.seq).all())
+        done = {int((p or {}).get("source_seq") or -1)
+                for _s, k, p in rows if k == "steer_injected"}
+        return [(int(sq), str((p or {}).get("message") or "").strip())
+                for sq, k, p in rows
+                if k == "steer_request" and int(sq) not in done
+                and str((p or {}).get("message") or "").strip()]
+    except Exception as e:  # noqa: BLE001
+        logger.debug("steer drain failed (fail-open): %s", e)
+        return []
+
+
 def _evict_superseded_reads(messages: list[dict], repo_id: str, path: str) -> int:
     """A successful edit of ``path`` makes every OLDER read_file output for it stale by
     definition — evict those NOW (supersede-aware) instead of letting dead bytes wait for
@@ -955,6 +993,26 @@ async def run_agent_loop(
                 heartbeat()
             except Exception:  # noqa: BLE001 — a heartbeat hiccup must not break the loop
                 pass
+        # G1 — mid-run operator steering: drain queued messages into THIS turn as a
+        # binding instruction (folded into the trailing user turn), ack each durably.
+        # Scout children never drain — a steer aimed at the run reaches the MAIN loop
+        # when it resumes, not whatever short-lived researcher happens to be running.
+        if (db is not None and not agent_name.endswith(":scout")
+                and getattr(settings, "agentic_steering_enabled", True)):
+            _steers = _pending_steers(db, run_id)
+            if _steers:
+                _append_user_text(messages, (
+                    "🧭 OPERATOR STEERING — binding course correction(s) from the human "
+                    "operator, received while you were working. Comply NOW (adjust your "
+                    "approach, and re-submit your plan if it changes what you will touch) "
+                    "and acknowledge briefly in your next reply:\n"
+                    + "\n".join(f"- {m}" for _sq, m in _steers)))
+                for _sq, _m in _steers:
+                    _emit("steer_injected",
+                          {"source_seq": _sq, "message_head": _m[:160],
+                           "action": "🧭 Steering applied to the live agent: " + _m[:160]})
+                logger.info("agent_loop[%s] run=%s iter=%d injected %d operator steer(s)",
+                            agent_name, run_id, i, len(_steers))
         # Durably checkpoint the cumulative read-set each iteration so a crash / sleep-suspend
         # mid-loop can RESUME with memory instead of re-exploring from turn 1 (the read-only
         # review's counterpart to the code phase's per-round code_resume). Cumulative through the
