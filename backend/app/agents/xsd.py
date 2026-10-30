@@ -41,22 +41,39 @@ XSD_GENERATION_SYSTEM_PROMPT = render_prompt(
 )
 
 
-async def stream_xsd_assessment(
-    tech_spec_content: str,
-    brd_content: str,
-) -> AsyncGenerator[str, None]:
-    """Assess whether XSD changes are required."""
-    message = f"""Analyse the following Technical Specification and BRD to determine
-whether XSD changes are required.
-
-TECHNICAL SPECIFICATION:
+def _context_block(tech_spec_content: str, brd_content: str, base_schemas: str = "") -> str:
+    """The grounding context for every XSD call: spec + BRD + (B1) the CURRENT
+    schemas the change touches. Without the base schemas the model was asked to
+    'keep existing elements intact' for files it had never seen — it reconstructed
+    them from memory, the single largest XSD-accuracy loss."""
+    context = f"""TECHNICAL SPECIFICATION:
 {wrap_untrusted(tech_spec_content[:4000] + ('...' if len(tech_spec_content) > 4000 else ''), "TECH_SPEC_CONTENT")}
 
 ---
 BRD (summary):
 {wrap_untrusted(brd_content[:2000] + ('...' if len(brd_content) > 2000 else ''), "BRD_CONTENT")}
 """
-    logger.info("XSDAgent — streaming assessment")
+    if base_schemas:
+        context += (
+            "\n---\nCURRENT SCHEMAS (authoritative BASE content, verbatim from the ecosystem):\n"
+            f"{wrap_untrusted(base_schemas, 'CURRENT_SCHEMAS')}\n"
+            "Ground every schema edit in the files above: PRESERVE existing elements, types, "
+            "namespaces and naming conventions EXACTLY, and modify only what this change "
+            "requires. Never re-author a schema from memory — if a base file you need is not "
+            "shown above, say so in the Summary instead of guessing its contents.\n")
+    return context
+
+
+async def stream_xsd_assessment(
+    tech_spec_content: str,
+    brd_content: str,
+    base_schemas: str = "",
+) -> AsyncGenerator[str, None]:
+    """Assess whether XSD changes are required."""
+    message = ("Analyse the following Technical Specification and BRD to determine\n"
+               "whether XSD changes are required.\n\n"
+               + _context_block(tech_spec_content, brd_content, base_schemas))
+    logger.info("XSDAgent — streaming assessment (schema_ctx_chars=%d)", len(base_schemas))
 
     async for chunk in stream_llm(system=ASSESSMENT_SYSTEM_PROMPT, messages=[{"role": "user", "content": message}], max_tokens=2048, agent_name="xsd"):
         yield chunk
@@ -67,21 +84,25 @@ async def stream_xsd_turn(
     brd_content: str,
     conversation_history: list[dict],
     new_user_message: str,
+    base_schemas: str = "",
 ) -> AsyncGenerator[str, None]:
     """Stream an XSD generation or feedback refinement turn."""
-    context = f"""TECHNICAL SPECIFICATION:
-{wrap_untrusted(tech_spec_content[:4000] + ('...' if len(tech_spec_content) > 4000 else ''), "TECH_SPEC_CONTENT")}
-
----
-BRD (summary):
-{wrap_untrusted(brd_content[:2000] + ('...' if len(brd_content) > 2000 else ''), "BRD_CONTENT")}
-"""
+    context = _context_block(tech_spec_content, brd_content, base_schemas)
     if len(conversation_history) == 0:
         messages = [{"role": "user", "content": f"{context}\n\n---\n{wrap_untrusted(new_user_message, 'USER_MESSAGE')}"}]
     else:
-        messages = conversation_history + [{"role": "user", "content": wrap_untrusted(new_user_message, "USER_MESSAGE")}]
+        # The persisted conversation keeps only the bare user/assistant texts — turn 1's
+        # ephemeral context (spec, BRD, base schemas) is NOT in it, so refine/repair turns
+        # used to run entirely WITHOUT the specification. Re-anchor every multi-turn call
+        # with a leading context exchange (an assistant ack keeps role alternation valid).
+        messages = ([{"role": "user", "content": context},
+                     {"role": "assistant",
+                      "content": "Understood — I have the specification, BRD and current schemas."}]
+                    + conversation_history
+                    + [{"role": "user", "content": wrap_untrusted(new_user_message, "USER_MESSAGE")}])
 
-    logger.info("XSDAgent — streaming turn, history_len=%d", len(messages))
+    logger.info("XSDAgent — streaming turn, history_len=%d schema_ctx_chars=%d",
+                len(messages), len(base_schemas))
 
     # max_tokens bumped 8096 → 24000 (2026-05-04, Layer-3 of truncation fix).
     # XSD outputs include full schema body + commentary; previously hit cap.

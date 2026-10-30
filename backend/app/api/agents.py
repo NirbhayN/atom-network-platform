@@ -2799,8 +2799,19 @@ async def assess_xsd(change_id: str, db: DbDep, _: CurrentUser):
 
     assessment_basis = (tech_spec.content if (tech_spec and tech_spec.content)
                         else _decisions_block(change_id, db))
+    # B1 — ground the assessment in the schemas that actually exist: files named by
+    # the spec/BRD plus the flow's involved schemas, from the workspace or the KB.
+    # Fail-open: an empty bundle just reproduces the old (ungrounded) behaviour.
+    schema_ctx = ""
+    try:
+        from app.services.xsd_context import build_involved_xsd_bundle, xsd_names_in
+        schema_ctx = build_involved_xsd_bundle(
+            change_id, db, max_total_chars=20_000,
+            extra_names=xsd_names_in(assessment_basis, brd.content), exclude_changed=False)
+    except Exception:  # noqa: BLE001
+        logger.warning("xsd assess: schema context unavailable change=%s", change_id, exc_info=True)
     full = ""
-    async for chunk in stream_xsd_assessment(assessment_basis, brd.content):
+    async for chunk in stream_xsd_assessment(assessment_basis, brd.content, base_schemas=schema_ctx):
         full += chunk
 
     # Determine if required from assessment text
@@ -3736,10 +3747,32 @@ async def ws_xsd(websocket: WebSocket, change_id: str):
                 db, registry_job_id, 0, xsd_milestones, 0,
             )
 
-            logger.info("WS xsd streaming started: change=%s", change_id)
+            # B1 — base-schema grounding: the generator must SEE the current content of
+            # every schema it is told to preserve (it was reconstructing them from
+            # memory). Candidates = flow-involved schemas + every .xsd the spec or the
+            # latest assessment names, from the workspace or the KB. Fail-open.
+            base_bundle = ""
+            try:
+                from app.services.xsd_context import build_involved_xsd_bundle, xsd_names_in
+                _latest_xsd = (db.query(XSD)
+                               .filter(XSD.change_request_id == change_id)
+                               .order_by(XSD.version.desc()).first())
+                base_bundle = build_involved_xsd_bundle(
+                    change_id, db,
+                    max_total_chars=int(getattr(_app_settings, "xsd_generation_schema_context_chars", 40_000)),
+                    extra_names=xsd_names_in(tech_spec_content,
+                                             (_latest_xsd.content if _latest_xsd else "")),
+                    exclude_changed=False)
+            except Exception:  # noqa: BLE001
+                logger.warning("WS xsd: base-schema bundle unavailable change=%s", change_id,
+                               exc_info=True)
+
+            logger.info("WS xsd streaming started: change=%s base_schema_chars=%d",
+                        change_id, len(base_bundle))
             full_response = ""
             try:
-                async for chunk in stream_xsd_turn(tech_spec_content, brd_content, prior_history, actual_msg):
+                async for chunk in stream_xsd_turn(tech_spec_content, brd_content, prior_history,
+                                                   actual_msg, base_schemas=base_bundle):
                     full_response += chunk
                     await job_registry.ws_send_chunk(websocket, registry_job_id, chunk)
                     stage_idx = job_registry.advance_stage_by_chars(
@@ -3753,6 +3786,50 @@ async def ws_xsd(websocket: WebSocket, change_id: str):
                 }))
                 continue
             logger.info("WS xsd streaming done: change=%s response_len=%d", change_id, len(full_response))
+
+            # B2 — deterministic compile gate + bounded repair loop: every generated
+            # ```xml block must build as an XML Schema; compiler errors are fed back
+            # verbatim and the model re-emits the COMPLETE corrected document. The
+            # compiler is free ground truth — residual errors never block (slipstream:
+            # they surface to the human in the done payload), but they are never silent.
+            from app.services.xsd_validation import compile_generated_schemas
+            compile_errors: list[str] = []
+            repair_rounds_used = 0
+            try:
+                compile_errors = compile_generated_schemas(full_response)
+                _max_repairs = max(0, int(getattr(_app_settings, "xsd_compile_repair_rounds", 2)))
+                while compile_errors and repair_rounds_used < _max_repairs:
+                    repair_rounds_used += 1
+                    logger.warning("WS xsd compile FAILED (%d error(s)) — repair round %d/%d: %s",
+                                   len(compile_errors), repair_rounds_used, _max_repairs,
+                                   compile_errors[:3])
+                    await job_registry.ws_send_chunk(
+                        websocket, registry_job_id,
+                        f"\n\n> ⚙ Schema compile check found {len(compile_errors)} error(s) — "
+                        f"repairing (round {repair_rounds_used})…\n\n")
+                    repair_history = prior_history + [
+                        {"role": "user", "content": actual_msg},
+                        {"role": "assistant", "content": full_response},
+                    ]
+                    repair_msg = ("Your generated schemas FAILED the XML Schema compiler. Fix "
+                                  "EXACTLY these defects and re-emit the COMPLETE corrected "
+                                  "document — same format, every file in full:\n- "
+                                  + "\n- ".join(compile_errors))
+                    repaired = ""
+                    async for chunk in stream_xsd_turn(tech_spec_content, brd_content,
+                                                       repair_history, repair_msg,
+                                                       base_schemas=base_bundle):
+                        repaired += chunk
+                        await job_registry.ws_send_chunk(websocket, registry_job_id, chunk)
+                    if repaired.strip():
+                        full_response = repaired
+                    compile_errors = compile_generated_schemas(full_response)
+            except Exception:  # noqa: BLE001 — the repair loop must never fail the turn
+                logger.warning("WS xsd compile/repair loop failed change=%s", change_id,
+                               exc_info=True)
+            if compile_errors:
+                logger.warning("WS xsd: %d compile error(s) remain after %d repair round(s)",
+                               len(compile_errors), repair_rounds_used)
 
             _save_message(change_id, ConversationModule.XSD, MessageRole.ASSISTANT, full_response, None, db)
 
@@ -3800,11 +3877,16 @@ async def ws_xsd(websocket: WebSocket, change_id: str):
             validation = summarize_validation(validate_doc(full_response, doc_type="xsd"))
             job_registry.complete_job(
                 db, registry_job_id,
-                result={"markdown_chars": len(full_response), "validation": validation},
+                result={"markdown_chars": len(full_response), "validation": validation,
+                        "compile_ok": not compile_errors,
+                        "compile_errors": compile_errors,
+                        "repair_rounds": repair_rounds_used},
                 final_stage="XSD ready",
             )
             await websocket.send_text(json.dumps({
                 "type": "done", "full": full_response, "validation": validation,
+                "compile": {"ok": not compile_errors, "errors": compile_errors,
+                            "repair_rounds": repair_rounds_used},
                 "job_id": registry_job_id,
             }))
 

@@ -63,3 +63,85 @@ def test_malformed_instance_is_not_double_reported():
               '<xs:element name="Root"/></xs:schema>')
     # not well-formed → fail-open, no finding from the instance path
     assert V.validate_xml_blocks("```xml\n<Root><unclosed>\n```", [schema]) == []
+
+
+# ── compile_generated_schemas (B2): deterministic compile gate for generated docs ──
+
+from app.services.xsd_validation import compile_generated_schemas
+
+
+def _doc(*files):
+    """Markdown doc in the generator's format: per-file heading + ```xml block."""
+    parts = []
+    for fname, xml in files:
+        parts.append(f"### `{fname}`\n\n```xml\n{xml}\n```")
+    return "\n\n".join(parts)
+
+
+_OK_SCHEMA = """<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t" xmlns="urn:t" elementFormDefault="qualified">
+  <xs:element name="Amount" type="xs:decimal"/>
+</xs:schema>"""
+
+
+def test_clean_schema_compiles_with_no_errors():
+    assert compile_generated_schemas(_doc(("amount.xsd", _OK_SCHEMA))) == []
+
+
+def test_no_xml_blocks_is_clean():
+    assert compile_generated_schemas("just prose, no schemas") == []
+    assert compile_generated_schemas("") == []
+
+
+def test_malformed_xml_is_reported():
+    errs = compile_generated_schemas(_doc(("broken.xsd", "<xs:schema><unclosed>")))
+    assert errs and "broken.xsd" in errs[0] and "well-formed" in errs[0]
+
+
+def test_non_schema_root_is_reported():
+    errs = compile_generated_schemas(_doc(("msg.xsd", "<Envelope><Body/></Envelope>")))
+    assert errs and "not an xs:schema" in errs[0]
+
+
+def test_invalid_facet_pattern_is_reported():
+    bad = """<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:t">
+  <xs:simpleType name="Code">
+    <xs:restriction base="xs:string"><xs:pattern value="[A-Z"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"""
+    errs = compile_generated_schemas(_doc(("code.xsd", bad)))
+    assert errs and "code.xsd" in errs[0]
+
+
+def test_sibling_include_resolves_inside_the_document():
+    # b.xsd includes a.xsd — both generated in the SAME doc: the sandbox materializes
+    # them under their filenames, so the include resolves and the type ref is checked.
+    a = """<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t" xmlns="urn:t">
+  <xs:simpleType name="Iban">
+    <xs:restriction base="xs:string"><xs:pattern value="[A-Z]{2}[0-9A-Z]+"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"""
+    b = """<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t" xmlns="urn:t">
+  <xs:include schemaLocation="a.xsd"/>
+  <xs:element name="Account" type="Iban"/>
+</xs:schema>"""
+    assert compile_generated_schemas(_doc(("a.xsd", a), ("b.xsd", b))) == []
+
+
+def test_external_base_schema_reference_is_not_a_defect():
+    # Importing an ecosystem base schema that is NOT part of this document must not
+    # fail the gate — nor should the unknown-type fallout it causes.
+    ext = """<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:t" xmlns="urn:t" xmlns:base="urn:base">
+  <xs:import namespace="urn:base" schemaLocation="ecosystem_base.xsd"/>
+  <xs:element name="Wrapped" type="base:CoreType"/>
+</xs:schema>"""
+    assert compile_generated_schemas(_doc(("wrap.xsd", ext))) == []
+
+
+def test_mixed_doc_reports_only_the_broken_file():
+    errs = compile_generated_schemas(_doc(("good.xsd", _OK_SCHEMA),
+                                          ("bad.xsd", "<xs:schema><oops>")))
+    assert len(errs) == 1 and errs[0].startswith("bad.xsd")

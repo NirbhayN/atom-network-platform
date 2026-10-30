@@ -40,10 +40,19 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 
 ## B. XSD generation (biggest unclaimed accuracy jump)
 
-1. ⬜ Inject base/involved XSDs into `stream_xsd_turn` — the generator is told to
-   preserve schemas it is never shown (reuse `build_involved_xsd_bundle`).
-2. ⬜ `xmlschema` compile of every generated block + bounded repair loop feeding
-   compiler errors back; also lift `retry_allowed=False` on the XSD checkpoint.
+1. ✅ Base-schema grounding: `stream_xsd_turn`/`stream_xsd_assessment` now receive
+   the CURRENT content of every involved schema (flow + spec-named files, workspace
+   or KB, 40K cap via `xsd_generation_schema_context_chars`). Bonus fix found en
+   route: refine turns ran entirely WITHOUT the spec/BRD (the persisted
+   conversation strips turn-1's ephemeral context) — every multi-turn call is now
+   re-anchored with a leading context exchange.
+2. ✅ Compile gate + repair loop: every generated ```xml block must be well-formed,
+   xs:schema-rooted, and build under `xmlschema` (sandboxed temp dir — sibling
+   include/import resolves inside the document; external base-schema refs and
+   their unknown-type fallout are not defects). Compiler errors feed up to
+   `xsd_compile_repair_rounds` (2) full re-emissions; residual errors surface in
+   the done payload/job result, never silently ship. `retry_allowed` flipped to
+   True on the TECH_SPEC_TO_XSD checkpoint (a retry is now compiler-checked).
 3. ⬜ Kill hard truncations: `tech_spec[:4000]`, `brd[:2000]` (xsd.py),
    `source_xsd[:8000]` (TSD writer) → section-aware selection + log when clipped.
 4. ⬜ Structured REQUIRED/NOT-REQUIRED decision (replace `"**REQUIRED**" in text`).

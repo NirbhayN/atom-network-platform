@@ -206,16 +206,34 @@ def _element_summary(content: str) -> str:
         return ""
 
 
+def xsd_names_in(*texts: str) -> set[str]:
+    """Every ``<name>.xsd`` token mentioned in the given texts — used to widen the
+    bundle's candidate set with files the assessment/tech-spec names explicitly."""
+    names: set[str] = set()
+    for t in texts:
+        names.update(_XSD_NAME_RE.findall(t or ""))
+    return names
+
+
 def build_involved_xsd_bundle(change_id: str, db: Session,
-                              max_total_chars: int = _BUNDLE_CAP) -> str:
+                              max_total_chars: int = _BUNDLE_CAP, *,
+                              extra_names: set[str] | None = None,
+                              exclude_changed: bool = True) -> str:
     """Per-schema context blocks for every UNCHANGED schema involved in the flow.
 
     The changed schema itself already reaches the TSD via ``source_xsd`` — this
     bundle deliberately excludes it and adds the surrounding flow: schemas whose
     file name matches a flow_spec/plan message token, plus include/import
     neighbours of the changed files from the XSD schema graph.
+
+    ``extra_names`` widens the candidate set (e.g. files the assessment names).
+    ``exclude_changed=False`` keeps the Phase-A-edited schemas IN the bundle — the
+    XSD *generation* path has no ``source_xsd`` channel, so there the current
+    content of every involved schema, changed or not, is the base to preserve.
     """
     names = _candidate_names(change_id, db)
+    if extra_names:
+        names |= {n.strip() for n in extra_names if n and n.strip()}
 
     run = None
     handoff: dict = {}
@@ -262,7 +280,8 @@ def build_involved_xsd_bundle(change_id: str, db: Session,
             nodes += (db.query(XsdSchemaNode)
                       .filter(XsdSchemaNode.id.in_(list(neighbour_ids))).all())
         for node in nodes:
-            if posixpath.basename(node.path) in changed_names or node.path in changed:
+            if exclude_changed and (posixpath.basename(node.path) in changed_names
+                                    or node.path in changed):
                 continue  # the changed schema rides in source_xsd, not here
             involved.setdefault(node.path, (node.repo_id, node.id))
     except Exception as e:  # noqa: BLE001
@@ -307,7 +326,7 @@ def build_involved_xsd_bundle(change_id: str, db: Session,
     covered_stems = {(_c[:-4] if _c.lower().endswith(".xsd") else _c).lower() for _c in covered_names}
     for n in sorted(names):
         n_stem = (n[:-4] if n.lower().endswith(".xsd") else n).lower()
-        if n in covered_names or n in changed_names or n_stem in covered_stems:
+        if n in covered_names or (exclude_changed and n in changed_names) or n_stem in covered_stems:
             continue
         src, body = _kb_schema_content(n, db)
         if body:

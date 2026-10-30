@@ -831,6 +831,14 @@ class Settings(BaseSettings):
     # S7 — XSD→Java link confidence floor (§7.3). Links below this are routed to
     # the "needs confirmation" list and NEVER presented as definite.
     xsd_link_min_confidence: float = 0.55
+    # XSD generation (doc path) grounding + compile gate (BACKLOG B1/B2). The
+    # generator sees the CURRENT content of every involved schema (workspace or KB,
+    # capped here), and every generated ```xml block must build as an XML Schema —
+    # compiler errors are fed back for up to this many repair rounds, then surfaced
+    # to the human (never silently shipped). 0 disables the repair loop (the compile
+    # result still reports).
+    xsd_generation_schema_context_chars: int = 40_000
+    xsd_compile_repair_rounds: int = 2
     # S10 — verification (§9). Comma-separated Maven modules whose compile errors
     # are SOFT-failed — but ONLY when the module is untouched and out-of-scope; a
     # change that edits it is gated normally (§9.2). EMPTY by default: verification

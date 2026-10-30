@@ -151,7 +151,10 @@ TECH_SPEC_TO_XSD = CheckpointContract(
         "EMPTY_OR_PLACEHOLDER_CONTENT",
     ],
     warn_codes=[],
-    retry_allowed=False,
+    # True since the generation path gained a deterministic compile gate + repair loop
+    # (compile_generated_schemas): a retry is now a meaningful recommendation — the
+    # regenerated schema is compiler-checked, not another roll of the same dice.
+    retry_allowed=True,
     override_allowed_roles=["product_owner", "tech_lead"],
 )
 
