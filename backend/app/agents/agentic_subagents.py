@@ -1520,7 +1520,9 @@ async def run_code_change(db, *, run_id: str, ctx: ContextPack, xsd_scope: XsdSc
             _CODE_PREFACE + _tests_clause() + _tsd_assertions_block
             + _patterns_clause() + _decisions,
         ),
-        tools=CODE_TOOLS, model=model, agent_name="code_change", db=db,
+        tools=(CODE_TOOLS if settings.agentic_scout_enabled
+               else [t for t in CODE_TOOLS if t["name"] != "scout"]),
+        model=model, agent_name="code_change", db=db,
         doc_sections={"brd": ctx.brd_sections, "tsd": ctx.tsd_sections,
                       "assessment": ctx.assessment_sections, "plan": ctx.plan_sections},
         thinking_budget=settings.agentic_thinking_budget_tokens,

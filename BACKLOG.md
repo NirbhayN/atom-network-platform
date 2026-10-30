@@ -17,9 +17,12 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
    summary call already has a two-step overflow ladder. Invariants now pinned by
    tests. (Audit note: `pack_within_budget` — the "plan could drop" risk — turned
    out to be UNCALLED dead code; candidate to wire into docgen or delete.)
-4. 🔶 **Subagent isolation** — phases are isolated; ⬜ add a read-only **scout
-   subagent** inside the code phase: exploration happens in the child, the editor
-   context carries only the brief.
+4. ✅ **Subagent isolation** — phases are isolated, AND the code agent now has a
+   `scout` tool: one broad research question runs in an isolated read-only child
+   loop (own RunContext, read-only tool subset, no plan requirement, bounded
+   iterations, shared per-run token budget); only the path:line brief returns —
+   the child's reads never enter the editor's context. Recursion-proof (a scout
+   carries no scout tool); `agentic_scout_enabled` to turn off.
 5. ✅ **File-state tracking** — a repeat FULL read of an unchanged file returns a
    short "UNCHANGED since your last full read" stub (`ctx.fresh_reads`): an edit
    discards the entry, external changes re-serve content (hash check), compaction
@@ -103,3 +106,5 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 - Context discipline (pillars A2/A3/A5): supersede-aware eviction after edits,
   unchanged-read stubs with compaction-safe invalidation, and compaction/trim
   invariants (brief + assistant reasoning never evicted) pinned by tests.
+- Scout subagent (pillar A4): `scout` tool in the code phase — isolated read-only
+  child loop answers one research question; only the brief returns.

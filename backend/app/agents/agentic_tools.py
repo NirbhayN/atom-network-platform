@@ -763,6 +763,13 @@ def submit_plan(ctx: RunContext, summary: str, files: list | None = None,
     return f"plan recorded — {n} file(s)" if n else "plan recorded"
 
 
+def scout(ctx: RunContext, question: str = "", paths: list | None = None) -> str:
+    """Placeholder — the runtime intercepts `scout` BEFORE dispatch and runs the child
+    loop there (the loop is async; tool handlers are sync). Reaching this handler means
+    the call happened outside the live agent loop (e.g. a direct execute_tool call)."""
+    raise ToolError("scout runs only inside the live agent loop")
+
+
 def _verify_evidence(ctx: RunContext, evidence: list) -> tuple[list, list]:
     """Split evidence into VERIFIED (a file the agent actually read this run, across any
     selected repo) vs UNVERIFIED. The network codebase is large and confusing, so a reuse-vs-
@@ -2339,6 +2346,7 @@ _DISPATCH = {
     "create_file": create_file,
     "delete_file": delete_file,
     "submit_plan": submit_plan,
+    "scout": scout,
     "ask_decision": ask_decision,
     "propose_approach": propose_approach,
     "propose_revision": propose_revision,
@@ -2467,6 +2475,22 @@ TOOL_SCHEMAS: list[dict] = [
                                               "verifies the behaviour at actual_path instead of demanding "
                                               "an edit to planned_path. Integration points in EXISTING "
                                               "files are binding and may NOT be reconciled away."},
+        }},
+    },
+    {
+        "name": "scout",
+        "description": "Delegate ONE broad, read-only research question to a scout subagent — "
+                       "it explores in its OWN context (its reads never enter yours) and returns "
+                       "a concise brief with path:line evidence. Use it for reconnaissance whose "
+                       "raw file contents you don't need verbatim: mapping a flow end-to-end, "
+                       "finding every consumer/usage across repos, understanding how an existing "
+                       "feature is wired. Do NOT use it for a file you are about to edit — "
+                       "editing requires your own read_file. Ask a specific, answerable question "
+                       "and include what you already know.",
+        "input_schema": {"type": "object", "required": ["question"], "properties": {
+            "question": _str("the research question, specific and self-contained"),
+            "paths": {"type": "array", "items": {"type": "string"},
+                      "description": "optional starting files/dirs the scout should check first"},
         }},
     },
     {

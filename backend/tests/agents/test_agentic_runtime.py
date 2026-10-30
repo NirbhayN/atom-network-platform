@@ -256,3 +256,81 @@ def test_loop_edit_supersedes_earlier_read_in_history(ws, monkeypatch):
                     if isinstance(b, dict) and b.get("type") == "tool_result"
                     and b.get("tool_use_id") == "t2"]
     assert read_results and str(read_results[0]["content"]).startswith("[evicted")
+
+
+# ── Scout subagent: exploration isolated in a child loop; only the brief returns ──
+
+def _capturing_fake(monkeypatch, script):
+    """Sequential scripted LLM shared by parent AND child loops; records each call's
+    messages + tool names so tests can assert what each loop actually saw."""
+    captured = {"messages": [], "tool_sets": []}
+
+    async def fake(**kwargs):
+        captured["messages"].append(kwargs.get("messages"))
+        captured["tool_sets"].append([t.get("name") for t in (kwargs.get("tools") or [])])
+        t = script[fake.i]
+        fake.i += 1
+        return t
+    fake.i = 0
+    monkeypatch.setattr(R, "call_messages_api_tools", fake)
+    return captured
+
+
+def test_scout_isolates_reads_and_returns_brief(ws, monkeypatch):
+    big = "".join(f"// filler {n}\n" for n in range(60))
+    (ws / "src" / "Flow.java").write_text("class Flow {\n" + big + "}\n")
+    cap = _capturing_fake(monkeypatch, [
+        # parent delegates reconnaissance
+        _turn([ToolUseRequest("s1", "scout",
+                              {"question": "where is the refund flow handled?",
+                               "paths": ["src/Flow.java"]})]),
+        # child loop: reads the file, then answers
+        _turn([ToolUseRequest("c1", "read_file", {"repo_id": RID, "path": "src/Flow.java"})]),
+        _turn([], text="1. ANSWER — refunds are handled in src/Flow.java:1\n"
+                       "2. EVIDENCE — src/Flow.java:1 class Flow", stop="end_turn"),
+        # parent finishes
+        _turn([], text="done", stop="end_turn"),
+    ])
+    res = asyncio.run(R.run_agent_loop(
+        run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go", db=None))
+    assert res.stopped == "completed"
+    # The child ran with the read-only subset: no edit/create/scout (no recursion).
+    child_tools = cap["tool_sets"][1]
+    assert "read_file" in child_tools
+    assert not {"edit_file", "create_file", "scout", "submit_plan"} & set(child_tools)
+    # The parent's final request carries the BRIEF, not the file body the child read.
+    final_parent_msgs = str(cap["messages"][-1])
+    assert "SCOUT BRIEF" in final_parent_msgs and "ANSWER — refunds" in final_parent_msgs
+    assert "// filler 7" not in final_parent_msgs, "child reads must not enter the parent context"
+    # The file body DID flow through the child's own context.
+    assert "// filler 7" in str(cap["messages"][2])
+
+
+def test_scout_inside_scout_is_refused_not_recursive(ws, monkeypatch):
+    cap = _capturing_fake(monkeypatch, [
+        _turn([ToolUseRequest("s1", "scout", {"question": "map the gateway"})]),
+        # child hallucinates a nested scout — unknown tool (not in its set), loop survives
+        _turn([ToolUseRequest("c1", "scout", {"question": "recurse!"})]),
+        _turn([], text="1. ANSWER — gateway mapped", stop="end_turn"),
+        _turn([], text="done", stop="end_turn"),
+    ])
+    res = asyncio.run(R.run_agent_loop(
+        run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go", db=None))
+    assert res.stopped == "completed"
+    # The nested call bounced as an error result in the CHILD's context (call #3 = child's
+    # second turn sees it) — the stub handler refuses it, since `scout` is absent from the
+    # child's tool list and the runtime's interception is gated on that list.
+    child_view = str(cap["messages"][2])
+    assert "only inside the live agent loop" in child_view
+    assert "SCOUT BRIEF" in str(cap["messages"][-1])
+
+
+def test_scout_without_question_bounces(ws, monkeypatch):
+    cap = _capturing_fake(monkeypatch, [
+        _turn([ToolUseRequest("s1", "scout", {})]),
+        _turn([], text="done", stop="end_turn"),
+    ])
+    res = asyncio.run(R.run_agent_loop(
+        run_id=RUN, selected_repo_ids=[RID], system="s", user_prompt="go", db=None))
+    assert res.stopped == "completed"
+    assert "scout needs a `question`" in str(cap["messages"][-1])

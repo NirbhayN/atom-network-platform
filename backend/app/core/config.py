@@ -801,6 +801,15 @@ class Settings(BaseSettings):
     # of approach) attached to its feedback — the counter to whack-a-mole rounds where each
     # patch mints the next failure. 0 disables. Advisory + fail-open.
     agentic_strategist_after_attempts: int = 3
+    # Scout subagent (context isolation): the code agent can delegate one broad,
+    # read-only research question to a CHILD loop whose file reads never enter the
+    # editor's context — only the scout's concise brief returns. Broad reconnaissance
+    # is the costliest context-bloat source; this is the Aider/Claude-style isolation
+    # for it. The child gets the read-only tool subset, no plan requirement, bounded
+    # iterations, and its LLM spend counts against the same per-run token budget.
+    agentic_scout_enabled: bool = True
+    agentic_scout_max_iterations: int = 14
+    agentic_scout_max_brief_chars: int = 6000
     # P2 — harness-truth exploration nudge: in the CODE phase, if this many consecutive
     # iterations pass without a single file edit, inject a deterministic harness-record
     # reminder (iterations/edits counts the model cannot fabricate) telling it to start

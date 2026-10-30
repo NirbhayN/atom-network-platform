@@ -306,6 +306,71 @@ def _evict_superseded_reads(messages: list[dict], repo_id: str, path: str) -> in
     return reclaimed
 
 
+# ── Scout subagent (context isolation) ─────────────────────────────────────────────
+# Broad reconnaissance is the costliest context-bloat source: mapping a flow can take
+# dozens of reads whose bodies the editor never needs verbatim. The `scout` tool runs
+# that exploration in a CHILD loop with its own RunContext — the reads live and die in
+# the child's context; only its concise brief returns to the editor as the tool result.
+
+_SCOUT_TOOL_NAMES = {"read_file", "grep", "glob", "find_existing_xsd", "code_search_semantic",
+                     "domain_docs_search", "module_context", "flow_context", "read_doc",
+                     "ast_query", "symbol_graph", "callers", "impact_analysis",
+                     "jaxb_accessors", "git_history"}
+
+_SCOUT_SYSTEM = (
+    "You are a read-only SCOUT answering ONE delegated question about this codebase. Read "
+    "whatever you need — your reads never reach the requester; only your final message does. "
+    "Batch independent tool calls, work breadth-first, and STOP the moment you can answer.\n"
+    "Your FINAL message is the deliverable — a tight brief:\n"
+    "1. ANSWER — the direct answer to the question.\n"
+    "2. EVIDENCE — the key files as path:line plus the one fact each establishes.\n"
+    "3. GAPS — anything you could not determine (state it plainly; never guess).\n"
+    "No preamble. Never invent a path, symbol, or line number."
+)
+
+
+async def _run_scout(parent_ctx, tool_input: dict, *, tools: list[dict], model,
+                     db, agent_name: str) -> tuple[str, bool]:
+    """Run one scout question in an isolated child loop. The child shares the run's
+    workspace, docs, and per-run token budget (same run_id → observability's budget
+    guard sees its calls) but has a FRESH RunContext — its reads do not satisfy the
+    parent's read-before-edit or evidence tracking, by design. Read-only tool subset,
+    no plan requirement, bounded iterations; the child cannot have `scout` itself, so
+    it cannot recurse. Fail-open: any failure returns an error the editor can route
+    around by exploring directly — never breaks the parent loop."""
+    question = ((tool_input or {}).get("question") or "").strip()
+    if not question:
+        return ("scout needs a `question` — one specific, answerable research question "
+                "(include what you already know / where to start)", True)
+    hints = (tool_input or {}).get("paths") or []
+    prompt = f"Question:\n{question}"
+    if isinstance(hints, list) and hints:
+        prompt += ("\n\nSuggested starting points (verify, don't trust):\n"
+                   + "\n".join(f"- {p}" for p in hints[:8]))
+    child_tools = [t for t in tools if (t or {}).get("name") in _SCOUT_TOOL_NAMES]
+    try:
+        res = await run_agent_loop(
+            run_id=parent_ctx.run_id, selected_repo_ids=list(parent_ctx.selected_repo_ids),
+            system=_SCOUT_SYSTEM, user_prompt=prompt, tools=child_tools, model=model,
+            agent_name=f"{agent_name}:scout", db=db, require_plan=False,
+            max_iterations=int(getattr(settings, "agentic_scout_max_iterations", 14)),
+            doc_sections=parent_ctx.doc_sections,
+            workspace_run_id=parent_ctx.workspace_run_id,
+        )
+    except Exception as e:  # noqa: BLE001 — a scout failure must never break the editor's loop
+        return f"scout failed ({e}) — explore directly with read_file/grep instead", True
+    brief = (res.final_text or "").strip()
+    if not brief:
+        return (f"scout returned no brief (stopped={res.stopped}) — explore directly instead", True)
+    cap = int(getattr(settings, "agentic_scout_max_brief_chars", 6000))
+    if len(brief) > cap:
+        brief = brief[:cap] + "\n…[scout brief truncated]"
+    note = (f"\n[scout stopped early: {res.stopped} — treat the brief as PARTIAL]"
+            if res.stopped != "completed" else "")
+    return (f"SCOUT BRIEF (researched in an isolated context — verify anything you are "
+            f"about to edit with your own read):\n{brief}{note}", False)
+
+
 def _reclaimable_tool_chars(messages: list[dict], keep_tail: int) -> int:
     """Chars ``_compact_messages`` WOULD reclaim right now — non-stub tool outputs above the
     evict floor, outside the kept tail. Zero means the history is already maximally compacted:
@@ -621,6 +686,7 @@ def _describe(name: str, ti: dict | None) -> str:
         "module_context": f"📦 Module {ti.get('module') or '(list all)'}",
         "verify_change": "🧪 Self-verify (compile + tests)",
         "submit_plan": "📝 Plan submitted",
+        "scout": "🔭 Scout dispatched",
         "propose_approach": "🧭 Proposed reuse-vs-new options for your decision",
         "propose_revision": "⚠ Your request is disruptive — proposed safer alternatives",
         "flag_concern": (f"⚠ Declined disruptive change: {(ti.get('declined_change') or '')[:60]}"
@@ -716,6 +782,8 @@ async def run_agent_loop(
     plan-revision. When None (the default), the loop starts fresh from ``user_prompt``."""
     import time
     tools = tools if tools is not None else T.TOOL_SCHEMAS
+    # Whether THIS loop may delegate to the scout child (never true inside a scout).
+    _scout_on = any((t or {}).get("name") == "scout" for t in tools)
     cap = max_iterations or settings.agentic_max_iterations
     out_tokens = max_tokens or settings.agentic_max_output_tokens
     ctx = T.RunContext(run_id=run_id, selected_repo_ids=list(selected_repo_ids), db=db,
@@ -1214,6 +1282,12 @@ async def run_agent_loop(
             # Tool-policy gate (§8): no blind .java edit — require blast-radius intel first.
             elif (gate := T.intel_gate_reason(ctx, tu.name, tu.input)):
                 text, is_error = gate, True
+            # Scout: async child loop — handled here, not in execute_tool (which is sync).
+            # Guarded on the LOOP's own tool list: a child loop never carries `scout`,
+            # so a hallucinated nested call falls through to the unknown-tool error.
+            elif tu.name == "scout" and _scout_on:
+                text, is_error = await _run_scout(ctx, tu.input, tools=tools, model=model,
+                                                  db=db, agent_name=agent_name)
             else:
                 text, is_error = T.execute_tool(ctx, tu.name, tu.input)
             tool_ms = int((time.monotonic() - tool_t0) * 1000)
