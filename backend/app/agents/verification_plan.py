@@ -400,8 +400,8 @@ def _dir_has_schema(repo_dir: Path, rel_dir: str) -> bool:
     return False
 
 
-def build_plan(db, run_id: str, change_set, *, app_blast_radius: bool = True
-               ) -> tuple[list[VerificationStep], set[str]]:
+def build_plan(db, run_id: str, change_set, *, app_blast_radius: bool = True,
+               incremental: bool = False) -> tuple[list[VerificationStep], set[str]]:
     """Deterministic plan from a ChangeSet. Returns ``(steps, touched_modules)``.
 
     **Core dependency repos build FIRST, as a full reactor install.** A repo with
@@ -461,7 +461,7 @@ def build_plan(db, run_id: str, change_set, *, app_blast_radius: bool = True
     for rid in sorted(dep_ids, key=_dep_order):
         repo = _repo(rid)
         steps.append(VerificationStep(
-            "install", rid, _mvn("install"),
+            "install", rid, _mvn("install", clean=not incremental),
             module=f"{(repo.label if repo else rid)} (full core build)", subdir=None))
         # Touched core modules are covered by the full build above; record them so
         # they're gated normally (not soft-failed) and don't get rebuilt per-module.
@@ -511,7 +511,7 @@ def build_plan(db, run_id: str, change_set, *, app_blast_radius: bool = True
                 # Working aggregator root → one reactor install builds ALL modules in
                 # dependency order (and runs generate-sources for any in-repo schema).
                 steps.append(VerificationStep(
-                    "install", rid, _mvn("install"),
+                    "install", rid, _mvn("install", clean=not incremental),
                     module=f"{(repo.label if repo else rid)} (full app build)", subdir=None))
             else:
                 # Non-aggregating root (build-from-dir) → build every module dir,
@@ -522,7 +522,7 @@ def build_plan(db, run_id: str, change_set, *, app_blast_radius: bool = True
                         steps.append(VerificationStep("generate_sources", rid,
                                      _mvn("generate-sources"), module=md, subdir=md))
                     steps.append(VerificationStep("install", rid,
-                                 _mvn("install"), module=md, subdir=md))
+                                 _mvn("install", clean=not incremental), module=md, subdir=md))
         return steps, touched
 
     # 2b) Cheap path (no cross-module surface change): only the touched modules. When the
@@ -554,14 +554,15 @@ def build_plan(db, run_id: str, change_set, *, app_blast_radius: bool = True
                              _mvn("generate-sources"), module=md, subdir=md))
             if aggregates and md != ".":
                 steps.append(VerificationStep("install", rid,
-                             _mvn_module("install", md), module=md, subdir=None))
+                             _mvn_module("install", md, clean=not incremental),
+                             module=md, subdir=None))
             else:
                 steps.append(VerificationStep("install", rid,
-                             _mvn("install"), module=md, subdir=md))
+                             _mvn("install", clean=not incremental), module=md, subdir=md))
     return steps, touched
 
 
-def _mvn(*goals: str) -> list[str]:
+def _mvn(*goals: str, clean: bool | None = None) -> list[str]:
     """Maven argv for a verify step. Builds ONLINE by default (resolves from Nexus, like a
     normal `mvn clean install`): `agentic_verify_offline` is False in config AND pinned
     "false" in compose for backend+celery. Offline (`-o`) is an opt-in for an air-gapped
@@ -591,13 +592,17 @@ def _mvn(*goals: str) -> list[str]:
     # `clean` before an install goal → a from-scratch build that matches the
     # deployment build (`mvn clean install -DskipTests`): no stale target/ from a
     # prior verify round can mask a removed/renamed symbol. Tunable for speed.
-    if getattr(settings, "agentic_verify_clean", True) and "install" in goals:
+    # `clean` override (G3): loop-back rounds build INCREMENTALLY (clean=False) so a
+    # fix-verify cycle costs seconds, not a from-scratch reactor; None = the global
+    # agentic_verify_clean default (the authoritative/sealing pass always passes True).
+    _clean = getattr(settings, "agentic_verify_clean", True) if clean is None else clean
+    if _clean and "install" in goals:
         argv.append("clean")
     argv += [*goals]
     return argv
 
 
-def _mvn_module(goal: str, module: str) -> list[str]:
+def _mvn_module(goal: str, module: str, clean: bool | None = None) -> list[str]:
     """`_mvn(goal)` scoped to ONE module PLUS its in-repo dependency siblings, off the
     aggregator root: ``mvn -pl <module> -am … <goal>``. Used so a touched submodule's
     intra-repo dependencies (e.g. gateway-web → tcp-controller/service-mesh-common) are
@@ -605,7 +610,7 @@ def _mvn_module(goal: str, module: str) -> list[str]:
     ``package … does not exist`` the agent can only "fix" by inventing a pom dependency.
     Caller MUST confirm the root aggregates (``_root_aggregates``); ``-pl``/``-am`` need a
     parseable root reactor, so a broken/non-aggregating root keeps the build-from-dir path."""
-    argv = _mvn(goal)
+    argv = _mvn(goal, clean=clean)
     return [argv[0], "-pl", module, "-am", *argv[1:]]
 
 

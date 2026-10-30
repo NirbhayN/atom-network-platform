@@ -152,6 +152,35 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
 3. ✅ `CODE_TO_REVIEW` / `REVIEW_TO_BUILD` stubs DELETED with a pointer: Phase B
    measurement lives in `agentic_metrics`, not the docgen checkpoint framework.
 
+## F. Claude-parity gaps (second audit, 2026-10-30)
+
+1. ⬜ **Mid-run steering** — the one deliberately left open: no channel to talk to a
+   RUNNING agent (corrections cost a park/decide/resume cycle). Build: a `steer`
+   endpoint queuing an operator message, drained at the next loop iteration as a
+   binding user turn; also lets ask_decision answers arrive without parking.
+2. ✅ Cross-run lessons memory: at COMPLETED, one bounded UTILITY-tier LLM call
+   distills the run's durable repo-general gotchas into `AGENT_LESSONS.md` rows
+   (RepoPathContext — no migration), deduped + capped FIFO, operator-editable;
+   injected into future runs' prompts as verify-before-relying hints. The only
+   mechanism here that makes the system better every week on its own.
+3. ✅ Round-aware verify speed: loop-back rounds build INCREMENTALLY (seconds, not
+   a from-scratch reactor); a green incremental round is SEALED by one clean pass
+   so stale-target/ masking stays impossible. Iterations are accuracy.
+4. ✅ Contained scratch runner (`scratch_run`, DEFAULT OFF): short python3 scripts
+   in a rlimited tempdir for hypothesis-testing diagnosis, repos exposed via
+   repos.json read-intent. Off because it changes the exec posture — flip
+   `agentic_scratch_enabled` where the deployment accepts it.
+5. ✅ Operator tool hooks: executables around every tool call (JSON on stdin);
+   pre-hook exit 2 blocks with its stdout as the model-visible error; fail-open.
+   Deployment policy without forking the harness.
+6. ✅ Per-round rewind: a checkpoint of every repo worktree before each code round
+   (`refs/atom/ckpt/*` — invisible to the MR, worktree/index untouched) +
+   `POST /api/agentic/runs/{id}/revert-round/{label}` restoring content and
+   deleting post-checkpoint files, lease-guarded.
+7. ✅ Metric blind spots closed: `scout_done` + `reads_superseded` events;
+   metrics now report scout adoption and `context_reclaimed_chars` (compaction +
+   supersede-eviction) — the context-discipline work is measurable.
+
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 
 - Per-module Java detection (legacy `1.8` ≡ `8`, property-aware, nested poms),

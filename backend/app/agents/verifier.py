@@ -33,7 +33,8 @@ class Verifier(Protocol):
     name: str
 
     def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True,
-               force_feature_tests: bool = False) -> VerificationOutcome:
+               force_feature_tests: bool = False,
+               incremental: bool = False) -> VerificationOutcome:
         """Verify ``change_set`` (an object exposing ``.operations``) for ``run_id``.
 
         ``app_blast_radius`` (default True) → on a schema/core change, full-build the
@@ -52,9 +53,13 @@ class LocalToolchainVerifier:
     name = "local"
 
     def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True,
-               force_feature_tests: bool = False) -> VerificationOutcome:
+               force_feature_tests: bool = False,
+               incremental: bool = False) -> VerificationOutcome:
+        # `incremental` (G3): loop-back rounds skip `clean` — fast feedback; the
+        # orchestrator SEALS any green incremental round with one clean pass.
         plan, touched = verification_plan.build_plan(db, run_id, change_set,
-                                                     app_blast_radius=app_blast_radius)
+                                                     app_blast_radius=app_blast_radius,
+                                                     incremental=incremental)
         if not plan:
             # Nothing buildable changed (e.g. docs only) — there's nothing to fail.
             return VerificationOutcome(status="verified", gates={}, plan=[])
@@ -83,7 +88,8 @@ class DeferredVerifier:
         self._reason = reason
 
     def verify(self, db, run_id: str, change_set, *, app_blast_radius: bool = True,
-               force_feature_tests: bool = False) -> VerificationOutcome:
+               force_feature_tests: bool = False,
+               incremental: bool = False) -> VerificationOutcome:
         return VerificationOutcome(status="unverified", gates={}, reason=self._reason)
 
 

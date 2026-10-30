@@ -267,6 +267,40 @@ def _compact_messages(messages: list[dict], keep_tail: int) -> int:
     return reclaimed
 
 
+def _run_tool_hook(stage: str, *, run_id: str, agent: str, iteration: int,
+                   tool: str, tool_input, result_head: str = "",
+                   is_error: bool | None = None) -> str | None:
+    """G5 — operator hook point around every tool call (Claude-Code-style hooks):
+    deterministic per-deployment policy WITHOUT forking the harness. The configured
+    executable gets a JSON event on stdin. Contract:
+
+    * ``pre``  — exit code 2 BLOCKS the call; the hook's stdout (capped) is returned
+      to the model as the tool error. Any other outcome allows the call.
+    * ``post`` — observational only; exit codes are ignored.
+    * Fail-open everywhere: a missing/crashing/slow hook (10s cap) never breaks the
+      loop — policy must degrade to "no policy", not to an outage.
+
+    Returns the block-message for a blocking pre hook, else None."""
+    import json as _json
+    import subprocess as _sp
+    cmd = (getattr(settings, f"agentic_hook_{stage}_tool", "") or "").strip()
+    if not cmd:
+        return None
+    payload = _json.dumps({
+        "stage": stage, "run_id": run_id, "agent": agent, "iteration": iteration,
+        "tool": tool, "tool_input": tool_input,
+        "result_head": (result_head or "")[:400], "is_error": is_error,
+    }, default=str)[:20_000]
+    try:
+        proc = _sp.run([cmd], input=payload, capture_output=True, text=True, timeout=10)
+        if stage == "pre" and proc.returncode == 2:
+            return ((proc.stdout or "").strip()
+                    or "blocked by the operator's pre-tool hook")[:500]
+    except Exception as e:  # noqa: BLE001 — a broken hook must never break the run
+        logger.warning("tool hook (%s) failed open: %s", stage, e)
+    return None
+
+
 def _evict_superseded_reads(messages: list[dict], repo_id: str, path: str) -> int:
     """A successful edit of ``path`` makes every OLDER read_file output for it stale by
     definition — evict those NOW (supersede-aware) instead of letting dead bytes wait for
@@ -358,6 +392,9 @@ async def _run_scout(parent_ctx, tool_input: dict, *, tools: list[dict], model,
             workspace_run_id=parent_ctx.workspace_run_id,
         )
     except Exception as e:  # noqa: BLE001 — a scout failure must never break the editor's loop
+        if db is not None:
+            emit_event(db, parent_ctx.run_id, "scout_done",
+                       {"ok": False, "error": str(e)[:200]})
         return f"scout failed ({e}) — explore directly with read_file/grep instead", True
     brief = (res.final_text or "").strip()
     if not brief:
@@ -367,6 +404,10 @@ async def _run_scout(parent_ctx, tool_input: dict, *, tools: list[dict], model,
         brief = brief[:cap] + "\n…[scout brief truncated]"
     note = (f"\n[scout stopped early: {res.stopped} — treat the brief as PARTIAL]"
             if res.stopped != "completed" else "")
+    if db is not None:   # G7 — adoption telemetry: are scouts actually used, and useful?
+        emit_event(db, parent_ctx.run_id, "scout_done",
+                   {"ok": True, "stopped": res.stopped, "iterations": res.iterations,
+                    "brief_chars": len(brief)})
     return (f"SCOUT BRIEF (researched in an isolated context — verify anything you are "
             f"about to edit with your own read):\n{brief}{note}", False)
 
@@ -1279,8 +1320,13 @@ async def run_agent_loop(
         results: list[dict] = []
         for tu in turn.tool_uses:
             tool_t0 = time.monotonic()
+            # Operator pre-tool hook (G5): deterministic deployment policy; exit 2 blocks.
+            _hook_block = _run_tool_hook("pre", run_id=run_id, agent=agent_name,
+                                         iteration=i, tool=tu.name, tool_input=tu.input)
             # Turn-1 plan enforcement: no mutation before a plan exists (§8).
-            if require_plan and tu.name in _MUTATING and ctx.plan is None:
+            if _hook_block is not None:
+                text, is_error = _hook_block, True
+            elif require_plan and tu.name in _MUTATING and ctx.plan is None:
                 text, is_error = "call submit_plan before editing files", True
             # Tool-policy gate (§8): no blind .java edit — require blast-radius intel first.
             elif (gate := T.intel_gate_reason(ctx, tu.name, tu.input)):
@@ -1317,6 +1363,9 @@ async def run_agent_loop(
             except Exception:
                 pass
             results.append(tool_result_block(tu.id, text, is_error=is_error))
+            _run_tool_hook("post", run_id=run_id, agent=agent_name, iteration=i,
+                           tool=tu.name, tool_input=tu.input,
+                           result_head=text or "", is_error=is_error)
             # Supersede-aware eviction: a landed edit makes every earlier read of that file
             # stale — reclaim those bytes now, not at the next compaction threshold. The
             # "edited " prefix distinguishes a real write from a staged/skipped schema write
@@ -1329,6 +1378,8 @@ async def run_agent_loop(
                     logger.info("agent_loop[%s] run=%s iter=%d evicted %d chars of reads "
                                 "superseded by edit of %s", agent_name, run_id, i, _sup,
                                 (tu.input or {}).get("path"))
+                    _emit("reads_superseded", {"chars": _sup,
+                                               "path": (tu.input or {}).get("path")})
 
         # Decision gate: propose_approach asked to stop for the human's reuse-vs-new
         # choice — end this pass cleanly (no edits happened; the orchestrator gates here).

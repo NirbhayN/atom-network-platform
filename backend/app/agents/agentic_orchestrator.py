@@ -1669,6 +1669,21 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
         logger.info("code: run=%s continuation round %d/%d (retry_feedback=%s, approach=%s)",
                     run.id, round_i + 1, max_cont + 1, bool(feedback),
                     (approach or {}).get("approach") if isinstance(approach, dict) else None)
+        # G6 — turn-level rewind: checkpoint every repo's worktree BEFORE the round so a
+        # bad round is one API call to undo (refs/atom/* — invisible to the MR). Fail-open.
+        try:
+            from app.agents import round_checkpoint as _ckpt
+            _label = f"r{round_i + 1}"
+            _shas = _ckpt.snapshot(run.id, _ws_id(run), list(run.selected_repo_ids or []), _label)
+            if _shas:
+                _h = dict(run.handoff_json or {})
+                _h.setdefault("round_ckpts", {})[_label] = _shas
+                run.handoff_json = _h
+                emit_event(db, run.id, "round_checkpoint",
+                           {"label": _label, "repos": len(_shas),
+                            "action": f"📍 Checkpoint {_label} — this round is revertible"})
+        except Exception as _e:  # noqa: BLE001 — losing rewind must never lose the round
+            logger.warning("round checkpoint failed run=%s: %s", run.id, _e)
         _cancel = lambda: S.check_cancel(db.get(AgenticRun, run.id)) or _lease_lost_set(art)
         _hb = _heartbeat(db, run, art)
         cs = await agentic_subagents.run_code_change(
@@ -1945,9 +1960,29 @@ def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = Tr
     # change (targeted, not the blanket agentic_run_feature_tests flag): a TSD that
     # names observable behaviours is only verified when the change's own tests RAN.
     _force_ft = bool((art or {}).get("tsd_assertions"))
+    # G3 — round-aware builds: the FIRST verify is clean (populates target/ anyway);
+    # loop-back rounds build INCREMENTALLY so a fix-verify cycle costs seconds. A
+    # green incremental round never counts on its own — it is SEALED below by one
+    # clean pass, so stale target/ classes can't mask a removed/renamed symbol.
+    _attempt = int((art or {}).get("verify_attempts") or 0) + 1
+    art["verify_attempts"] = _attempt
+    _incremental = (_attempt > 1
+                    and bool(getattr(settings, "agentic_verify_incremental_rounds", True)))
     outcome = verifier.verify(db, _ws_id(run), _disk_change_set(db, run),
                               app_blast_radius=app_blast_radius,
-                              force_feature_tests=_force_ft)
+                              force_feature_tests=_force_ft,
+                              incremental=_incremental)
+    if _incremental and outcome.status == "verified":
+        logger.info("verify: run=%s incremental round %d is GREEN — sealing with a clean pass",
+                    run.id, _attempt)
+        emit_event(db, run.id, "verify_sealing",
+                   {"attempt": _attempt,
+                    "action": "🧱 Incremental build green — confirming with one from-scratch "
+                              "clean build before the verdict counts"})
+        outcome = verifier.verify(db, _ws_id(run), _disk_change_set(db, run),
+                                  app_blast_radius=app_blast_radius,
+                                  force_feature_tests=_force_ft,
+                                  incremental=False)
     errors = verification_plan.format_errors(outcome)
     modules = getattr(outcome, "module_results", {}) or {}
     art["verification"] = {"status": outcome.status, "gates": outcome.gates,
@@ -4164,6 +4199,20 @@ async def push_run(db, run_id: str, *, owner: str = "orchestrator") -> dict:
         logger.info("push_run: run=%s pushing branch=%s", run_id, branch)
         result = _push_all(db, run_id, man, branch, ws_id)
         S.mark_terminal(db, run, AgenticStatus.COMPLETED)
+        # G2 — the run is done: distill its durable, repo-general gotchas into the
+        # cross-run lesson store so the NEXT change starts smarter. Bounded + fail-open;
+        # an isolated session so a distillation hiccup can't touch this transaction.
+        if getattr(settings, "agentic_lessons_enabled", True):
+            try:
+                import asyncio as _aio
+                from app.services import agentic_lessons as _AL
+                _added = await _aio.wait_for(_AL.distill_for_run(run.id), timeout=90)
+                if _added:
+                    emit_event(db, run.id, "lessons_learned",
+                               {"count": _added,
+                                "action": f"🧠 {_added} lesson(s) saved for future runs on these repos"})
+            except Exception as _e:  # noqa: BLE001 — memory is a bonus, never a failure mode
+                logger.warning("lessons distillation skipped for run=%s: %s", run.id, _e)
         emit_event(db, run_id, "completed", {"branch": branch, **result})
         db.commit()
         logger.info("push_run: run=%s COMPLETED branch=%s pushed=%s repos=%s mrs=%s",

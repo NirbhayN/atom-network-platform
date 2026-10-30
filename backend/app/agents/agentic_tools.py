@@ -852,6 +852,55 @@ def submit_plan(ctx: RunContext, summary: str, files: list | None = None,
     return (f"plan recorded — {n} file(s){suffix}" if n else "plan recorded")
 
 
+def scratch_run(ctx: RunContext, script: str = "", timeout_s: int = 0) -> str:
+    """G4 — contained scratch runner: a SHORT python3 script for hypothesis-testing
+    diagnosis (parse a log, count call sites, check an invariant) — the move that
+    turns "I believe X" into "I verified X". OPT-IN (agentic_scratch_enabled, default
+    off): unlike the argv-allowlisted run_command this is arbitrary code execution;
+    containment is clean env + tempdir cwd + RLIMIT_AS/CPU + timeout, NOT a
+    filesystem/network sandbox. The repo clones are exposed READ-intent via a
+    repos.json map in the cwd; writes belong to edit_file/create_file (tracked,
+    guarded), never to scratch scripts."""
+    from app.core.config import settings as _s
+    if not getattr(_s, "agentic_scratch_enabled", False):
+        raise ToolError("scratch_run is DISABLED on this deployment (AGENTIC_SCRATCH_ENABLED"
+                        "=false) — diagnose with read_file/grep/ast_query/run_command instead")
+    script = (script or "").strip()
+    if not script:
+        raise ToolError("scratch_run needs `script` — a short, self-contained python3 script")
+    if len(script) > 20_000:
+        raise ToolError("script too large (>20k chars) — scratch scripts are for quick "
+                        "diagnosis, not implementation")
+    import json as _json
+    import subprocess as _sp
+    import tempfile
+    cap = max(5, min(int(timeout_s or 0) or int(getattr(_s, "agentic_scratch_timeout_s", 60)), 120))
+    repos = {rid: str(_repo_root(ctx, rid)) for rid in (ctx.selected_repo_ids or [])}
+
+    def _limits():   # pragma: no cover — exercised in the child process
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (512 << 20, 512 << 20))
+        resource.setrlimit(resource.RLIMIT_CPU, (cap, cap))
+
+    with tempfile.TemporaryDirectory(prefix="atom_scratch_") as td:
+        Path(td, "scratch.py").write_text(script, encoding="utf-8")
+        Path(td, "repos.json").write_text(_json.dumps(repos, indent=1), encoding="utf-8")
+        try:
+            proc = _sp.run(["python3", "scratch.py"], cwd=td, capture_output=True, text=True,
+                           timeout=cap, env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+                           preexec_fn=_limits if os.name == "posix" else None)
+        except _sp.TimeoutExpired:
+            raise ToolError(f"scratch script TIMED OUT after {cap}s — narrow what it does")
+        except FileNotFoundError:
+            raise ToolError("python3 is not available on this host — scratch_run cannot run")
+    out = ((proc.stdout or "") + (("\n--- stderr ---\n" + proc.stderr) if proc.stderr else "")).strip()
+    header = f"[scratch exit={proc.returncode}] repos.json in cwd mapped: {', '.join(repos) or '(none)'}"
+    if len(out) > 8_000:
+        oid = _stash_output(ctx, out)
+        out = out[:4000] + f"\n…[truncated — read_output('{oid}') for the full {len(out)} chars]"
+    return f"{header}\n{out or '(no output)'}"
+
+
 def scout(ctx: RunContext, question: str = "", paths: list | None = None) -> str:
     """Placeholder — the runtime intercepts `scout` BEFORE dispatch and runs the child
     loop there (the loop is async; tool handlers are sync). Reaching this handler means
@@ -2436,6 +2485,7 @@ _DISPATCH = {
     "delete_file": delete_file,
     "submit_plan": submit_plan,
     "scout": scout,
+    "scratch_run": scratch_run,
     "ask_decision": ask_decision,
     "propose_approach": propose_approach,
     "propose_revision": propose_revision,
@@ -2569,6 +2619,20 @@ TOOL_SCHEMAS: list[dict] = [
                                               "verifies the behaviour at actual_path instead of demanding "
                                               "an edit to planned_path. Integration points in EXISTING "
                                               "files are binding and may NOT be reconciled away."},
+        }},
+    },
+    {
+        "name": "scratch_run",
+        "description": "Run a SHORT python3 script in a contained scratch directory to TEST a "
+                       "hypothesis deterministically — parse a log, count call sites across files, "
+                       "check an invariant — when reading alone can't settle it. `repos.json` in "
+                       "the cwd maps repo_id → absolute clone path (open files via it, READ "
+                       "only — all edits go through edit_file). stdout/stderr come back (capped; "
+                       "overflow via read_output). Not for implementation work, network calls, or "
+                       "anything slow.",
+        "input_schema": {"type": "object", "required": ["script"], "properties": {
+            "script": _str("a self-contained python3 script (≤20k chars)"),
+            "timeout_s": {"type": "integer", "description": "seconds (5–120; default 60)"},
         }},
     },
     {

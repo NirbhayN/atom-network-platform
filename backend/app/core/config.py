@@ -947,6 +947,33 @@ class Settings(BaseSettings):
     # reuse stale target/ classes and mask a removed/renamed symbol. Set false to
     # trade that safety for faster incremental verify rounds.
     agentic_verify_clean: bool = True
+    # G3 — round-aware verify speed: loop-back rounds (attempt ≥ 2) build
+    # INCREMENTALLY so a fix-verify cycle costs seconds instead of a from-scratch
+    # reactor; the moment an incremental round goes green it is SEALED by one clean
+    # authoritative pass, so the stale-target/ masking risk the clean default guards
+    # is preserved. More iterations fit the same budget — iterations ARE accuracy.
+    agentic_verify_incremental_rounds: bool = True
+    # G2 — cross-run memory: at COMPLETED, distill the run's durable repo-general
+    # gotchas (one bounded UTILITY-tier LLM call, fail-open) into AGENT_LESSONS.md
+    # rows (RepoPathContext) and inject them into future runs' context packs. The
+    # store is operator-editable; capped FIFO per repo.
+    agentic_lessons_enabled: bool = True
+    agentic_lessons_max: int = 40
+    # G5 — operator tool hooks (Claude-Code-style): absolute paths to executables run
+    # around EVERY agent tool call with a JSON event on stdin. pre-hook exit code 2
+    # BLOCKS the call (its stdout becomes the tool error the model sees); everything
+    # else is fail-open. Blank = disabled, zero overhead. Deterministic per-deployment
+    # policy without forking the harness.
+    agentic_hook_pre_tool: str = ""
+    agentic_hook_post_tool: str = ""
+    # G4 — contained scratch runner: lets the code agent run SHORT python3 scripts in
+    # a tempdir with rlimits for hypothesis-testing diagnosis (the Claude-Code "write
+    # a ten-line script to prove it" move). DEFAULT OFF: unlike the argv-allowlisted
+    # run_command, this is arbitrary code execution — containment is rlimits + clean
+    # env + tmp cwd, NOT a network/filesystem sandbox. Flip on only for deployments
+    # that already trust the agent with repo writes and accept that posture.
+    agentic_scratch_enabled: bool = False
+    agentic_scratch_timeout_s: int = 60
     # Modules to EXCLUDE from the verification verdict — comma-separated wildcard
     # patterns (`*` = any chars, matched case-insensitively against the Maven module
     # name and the failing line). A build failure attributable to a matching module —

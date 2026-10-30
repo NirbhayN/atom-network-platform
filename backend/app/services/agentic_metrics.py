@@ -33,7 +33,8 @@ GATE_KINDS = ("contract_gate", "di_wiring_gate", "cross_module_gate",
               "plan_fidelity_stale", "tsd_approval_gate")
 # Loop-health kinds worth counting per run.
 LOOP_KINDS = ("review", "review_blocked", "loop_capped", "plan_incomplete",
-              "verify_decision_needed", "history_compacted", "verify_unverified")
+              "verify_decision_needed", "history_compacted", "verify_unverified",
+              "scout_done", "reads_superseded", "verify_sealing")
 _WATCH_KINDS = GATE_KINDS + LOOP_KINDS + ("verification",)
 
 _TERMINAL = {"completed", "failed"}
@@ -50,6 +51,9 @@ def summarize_runs(runs: list[dict], events_by_run: dict[str, list[dict]]) -> di
     unverified_completions = 0
     review_round_counts: list[int] = []
     verify_attempt_counts: list[int] = []
+    reclaimed_chars = 0
+    scout_runs = 0
+    scout_ok = 0
 
     for run in runs:
         rid = run.get("id") or ""
@@ -64,11 +68,20 @@ def summarize_runs(runs: list[dict], events_by_run: dict[str, list[dict]]) -> di
         verifies = 0
         for e in events:
             ek = e.get("kind") or ""
+            pl = e.get("payload") or {}
             if ek == "verification":
                 verifies += 1
-                last_verify = ((e.get("payload") or {}).get("status") or "").lower() or last_verify
+                last_verify = (pl.get("status") or "").lower() or last_verify
             elif ek == "review":
                 reviews += 1
+            elif ek == "history_compacted":
+                reclaimed_chars += int(pl.get("reclaimed_chars") or 0)
+            elif ek == "reads_superseded":
+                reclaimed_chars += int(pl.get("chars") or 0)
+            elif ek == "scout_done":
+                scout_runs += 1
+                if pl.get("ok"):
+                    scout_ok += 1
             if ek in gates:
                 gates[ek] += 1
             if ek in loop:
@@ -102,6 +115,11 @@ def summarize_runs(runs: list[dict], events_by_run: dict[str, list[dict]]) -> di
                                 if verify_attempt_counts else None),
         "gates_fired": gates,
         "loop_health": loop,
+        # G7 — is the context-discipline work actually paying? Chars reclaimed by
+        # compaction + supersede-eviction, and scout adoption (delegated research).
+        "context_reclaimed_chars": reclaimed_chars,
+        "scout_runs": scout_runs,
+        "scout_ok": scout_ok,
     }
 
 

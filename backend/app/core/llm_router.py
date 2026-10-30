@@ -119,6 +119,7 @@ _AGENT_PURPOSE: dict[str, Purpose] = {
 
     # Utility — cheap content transformations
     "ambiguity_detector":   Purpose.UTILITY,
+    "lessons":              Purpose.UTILITY,   # cross-run lesson distillation (G2)
     "assumption_handler":   Purpose.UTILITY,
     "context_compressor":   Purpose.UTILITY,
     "code_summarizer":      Purpose.UTILITY,

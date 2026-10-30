@@ -55,6 +55,9 @@ class ContextPack:
     # census, plan sections, …). Rendered into the prompt so "empty" is never
     # mistaken for "checked and absent", and the agent knows to verify with tools.
     degraded: list[str] = field(default_factory=list)
+    # G2 — cross-run lessons: machine-distilled, repo-scoped gotchas from PREVIOUS
+    # completed runs (agentic_lessons). Advisory: verify before relying.
+    lessons: dict[str, str] = field(default_factory=dict)
     # {repo_id: {extension: count}} — every file extension actually present in the
     # clone. Purely DERIVED by walking the workspace: no extension list, no language
     # or schema-format knowledge, so a Python/Protobuf repo censuses as such. See
@@ -382,6 +385,16 @@ def _impact_files_age(db, desc: str, degraded: list | None = None) -> list[str]:
         return []
 
 
+def _lessons_safe(db, repo_ids: list[str]) -> dict[str, str]:
+    """G2 — lessons from previous runs on these repos. Fail-open to {}."""
+    try:
+        from app.services.agentic_lessons import load_lessons
+        return load_lessons(db, repo_ids)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("lessons unavailable (fail-open): %s", e)
+        return {}
+
+
 def _plan_sections(db, change_request_id: str, degraded: list | None = None) -> dict[str, str]:
     """The RATIFIED Change-Analysis plan as ``{heading: body}`` for read_doc(doc='plan').
     Full fidelity (pretty-printed JSON per section) — this is the retrieval path behind
@@ -574,4 +587,5 @@ def assemble_context_pack(
             _plan_sections(db, change_request_id, degraded), "plan", run_id),
         intent=intent or "",
         degraded=degraded,
+        lessons=_lessons_safe(db, repo_ids),
     )

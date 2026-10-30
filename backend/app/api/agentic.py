@@ -2547,6 +2547,33 @@ def get_walkthrough(run_id: str, db: DbDep, current_user: CurrentUser):
     return {"run_id": run_id, "generated": bool(wt), "walkthrough": wt or None}
 
 
+@router.post("/agentic/runs/{run_id}/revert-round/{label}")
+def revert_round(run_id: str, label: str, db: DbDep, current_user: CurrentUser):
+    """G6 — turn-level rewind: restore every repo worktree to the checkpoint taken
+    BEFORE code round ``label`` (e.g. ``r3``). Refuses while the run is actively
+    leased (a live agent would fight the restore). Emits ``round_reverted``."""
+    run = _run_or_404(db, run_id)
+    _authz_write(run, current_user)
+    from app.models.base import utcnow
+    if run.lease_owner and run.lease_expires_at and run.lease_expires_at > utcnow():
+        raise HTTPException(status_code=409,
+                            detail="run is actively leased — pause/cancel it before reverting")
+    ckpts = (run.handoff_json or {}).get("round_ckpts") or {}
+    ckpt = ckpts.get(label)
+    if not ckpt:
+        raise HTTPException(status_code=404,
+                            detail=f"no checkpoint '{label}' — available: {sorted(ckpts) or 'none'}")
+    from app.agents.agentic_events import emit_event
+    from app.agents.round_checkpoint import revert as _revert
+    result = _revert(run.id, run.workspace_run_id or run.id, ckpt)
+    emit_event(db, run.id, "round_reverted",
+               {"label": label, **{k: len(v) for k, v in result.items()},
+                "action": f"⏪ Workspace reverted to checkpoint {label} "
+                          f"({len(result['reverted'])} repo(s); {len(result['failed'])} failed)"})
+    db.commit()
+    return {"label": label, **result}
+
+
 @router.post("/agentic/runs/{run_id}/walkthrough")
 async def generate_run_walkthrough(run_id: str, db: DbDep, current_user: AgenticUser):
     """On-demand: generate the plain-language developer + tester walkthrough for this run's

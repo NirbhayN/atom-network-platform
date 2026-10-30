@@ -682,11 +682,19 @@ def build_system_segments(ctx: ContextPack, preface: str) -> list[dict]:
     degraded = ("⚠ CONTEXT DEGRADED — these grounding sources FAILED to load (absent, not "
                 "empty). Verify the missing ground yourself with tools before relying on "
                 "anything's absence:\n- " + "\n- ".join(_degraded)) if _degraded else ""
+    # G2 — lessons previous runs learned on these repos (machine-distilled, advisory).
+    _lessons = getattr(ctx, "lessons", None) or {}
+    lessons = ""
+    if _lessons:
+        body = "\n\n".join(f"### repo {rid}\n{txt}" for rid, txt in sorted(_lessons.items()))
+        lessons = ("LEARNED GOTCHAS — distilled from previous completed runs on these repos "
+                   "(machine-written; treat as strong hints and VERIFY before relying):\n"
+                   + body[:2500])
     return segments_for_prompt_cache([
         (preface, True),
         (_module_block(ctx), True),
         (docs, True),
-        ("\n".join(p for p in (repos, _census_block(ctx), impact, degraded,
+        ("\n".join(p for p in (repos, _census_block(ctx), impact, lessons, degraded,
                                _stale_banner(ctx)) if p), False),
     ])
 
@@ -1577,8 +1585,10 @@ async def run_code_change(db, *, run_id: str, ctx: ContextPack, xsd_scope: XsdSc
             _CODE_PREFACE + _tests_clause() + _tsd_assertions_block
             + _patterns_clause() + _decisions,
         ),
-        tools=(CODE_TOOLS if settings.agentic_scout_enabled
-               else [t for t in CODE_TOOLS if t["name"] != "scout"]),
+        tools=[t for t in CODE_TOOLS if {
+            "scout": settings.agentic_scout_enabled,
+            "scratch_run": getattr(settings, "agentic_scratch_enabled", False),
+        }.get(t["name"], True)],
         model=model, agent_name="code_change", db=db,
         doc_sections={"brd": ctx.brd_sections, "tsd": ctx.tsd_sections,
                       "assessment": ctx.assessment_sections, "plan": ctx.plan_sections},
