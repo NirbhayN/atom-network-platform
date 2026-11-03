@@ -924,3 +924,49 @@ def test_run_view_reports_snapshot_durability_without_the_file_contents(monkeypa
     assert "ops" not in view, "megabytes of file content never ride a status response"
     run.handoff_json = {}
     assert A._run_view(run)["green_snapshot"] is None
+
+
+# ── W7: preface directives ───────────────────────────────────────────────────────
+#
+# Prompt-only, so the test is that the directive actually REACHES the agent: each one
+# is asserted on the assembled preface, not just on its source file. A prompt file that
+# silently stops being concatenated is a capability lost with no other symptom.
+
+def _code_preface():
+    from app.agents.agentic_subagents import _CODE_PREFACE
+    return _CODE_PREFACE
+
+
+def test_defect_work_must_reproduce_and_record_the_baseline_first():
+    p = _code_preface()
+    assert "REPRODUCE BEFORE YOU FIX" in p
+    assert "record_fact the observed BASELINE" in p
+    assert "hypothesis" in p and "labelled as one" in p, \
+        "an unreproducible defect fix must be labelled, not reported as a repair"
+    # and it reaches the XSD phase too — a schema defect deserves the same baseline
+    from app.agents.agentic_subagents import _XSD_PREFACE
+    assert "REPRODUCE BEFORE YOU FIX" in _XSD_PREFACE
+
+
+def test_multi_file_work_must_keep_the_tree_compiling_between_slices():
+    p = _code_preface()
+    assert "SEQUENCE MULTI-FILE WORK SO THE TREE COMPILES BETWEEN SLICES" in p
+    # the REASON is the stop-safety rule the harness enforces elsewhere (W1/W5)
+    assert "stopped at ANY turn" in p and "token budget runs out" in p
+    assert "worse than one never started" in p
+
+
+def test_plan_sizing_comes_after_reading_and_is_resubmitted_when_reading_changes_it():
+    p = _code_preface()
+    assert "SIZE THE WORK AFTER YOU HAVE READ THE INTEGRATION POINTS" in p
+    assert "RE-SUBMIT the plan" in p
+    assert "Do NOT pad the first plan" in p, "re-planning must not become plan inflation"
+
+
+def test_the_new_directives_did_not_displace_the_existing_ones():
+    # These files are concatenated; an edit that clobbers a neighbour is invisible.
+    p = _code_preface()
+    for kept in ("IMPLEMENT THE WHOLE FLOW", "DEFECT-CLASS BLAST RADIUS",
+                 "BATCH INDEPENDENT TOOL CALLS", "CONVERGE", "You own recovery",
+                 "STAGED GENERATION", "GOVERNING PRIORITY ORDER"):
+        assert kept in p, f"{kept!r} went missing"

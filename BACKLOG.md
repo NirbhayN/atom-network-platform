@@ -302,6 +302,27 @@ colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
    a `green_snapshot` header with the `ops` payload STRIPPED (megabytes of file content
    have no business in a status response). Fail-open: a snapshot miss never fails a
    green build, and a rebuild never raises into a push.
+7. ✅ **Preface directives (prompt-only)** — three working habits the harness can nudge
+   but not manufacture, added to the swappable subagent prompt files:
+   (a) `self_heal.md` — **REPRODUCE BEFORE YOU FIX**: for a DEFECT intent, observe the
+   current behaviour first (run the failing test / the misbehaving command / read the
+   path), `record_fact` the observed BASELINE with its quoted evidence, fix, then
+   observe again and compare. Prevents the two failures that read identically in a
+   summary — "fixing" code that was already correct because the report misdescribed it,
+   and declaring a fix whose effect can't be pointed at. An unreproducible defect must
+   be labelled a hypothesis, naming what was tried, not reported as a repair.
+   (b) `completeness.md` — **SEQUENCE MULTI-FILE WORK SO THE TREE COMPILES BETWEEN
+   SLICES**, with the stop-safety reason stated (W1/W5: you can be stopped at any turn
+   and the disk is what the next person inherits): introduce the callee before its call
+   sites, change a signature and all its callers inside one slice, `verify_change` at
+   each boundary, and if a piece can't compile half-done do all of it in one slice.
+   (c) `efficiency.md` — **SIZE THE WORK AFTER YOU HAVE READ THE INTEGRATION POINTS**:
+   the first plan is a hypothesis formed before reading, so RE-SUBMIT it when reading
+   changes it — a stale plan cuts both ways (phantom work demanded, real work missing) —
+   while explicitly forbidding padding the first plan to look thorough.
+   Tested on the ASSEMBLED prefaces, not the source files, plus a regression that the
+   existing directives weren't displaced: these files are concatenated, so one that
+   silently stops being included is a capability lost with no other symptom.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 
