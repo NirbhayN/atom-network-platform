@@ -980,6 +980,19 @@ class Settings(BaseSettings):
     # The Claude-Code interaction property: corrections cost seconds, not a
     # park → decide → resume cycle. Scout children never drain steers.
     agentic_steering_enabled: bool = True
+    # W6 — green-state preservation: on every GREEN verify, persist the whole disk
+    # change-set (paths + content) onto the run, so a verified-but-unpushed change
+    # survives the workspace GC that would otherwise destroy it (reverify's "expired"
+    # path, and a push whose tree was collected between approval and push). Verified
+    # work becomes durable the moment it is verified, and push/re-verify can rebuild
+    # the tree from the snapshot instead of asking for a whole re-run.
+    #
+    # The cap is a SAFETY limit, not a quality dial: a snapshot that would exceed it is
+    # persisted marked INCOMPLETE with the omitted paths named, and the re-materialize
+    # path then REFUSES to rebuild from it — pushing a partial change-set is far worse
+    # than re-running. Raise it if your changes legitimately exceed it (handoff_json is
+    # a Postgres JSON column; a few MB is fine, hundreds are not). 0 disables snapshots.
+    agentic_green_snapshot_max_bytes: int = 4_000_000
     # Modules to EXCLUDE from the verification verdict — comma-separated wildcard
     # patterns (`*` = any chars, matched case-insensitively against the Maven module
     # name and the failing line). A build failure attributable to a matching module —

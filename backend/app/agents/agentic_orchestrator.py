@@ -2169,6 +2169,184 @@ def _stamp_last_green(db, run: AgenticRun, art: dict, attempt: int) -> None:
         logger.debug("last-green stamp failed run=%s", run.id, exc_info=True)
 
 
+def _persist_green_change_set(db, run: AgenticRun) -> dict | None:
+    """W6 — make a GREEN change-set durable the moment it is green.
+
+    Until now, verified-but-unpushed work lived in exactly one place: the on-disk clone.
+    The hourly workspace GC collects that tree, and everything downstream then reports
+    the change as gone — ``reverify_run`` returns "expired … re-run the change", and a
+    push whose tree was collected between approval and push fails its content preflight.
+    A human-approved, build-verified change was destroyed by a cache eviction, and the
+    only remedy on offer was to generate it again.
+
+    So snapshot it: every disk operation with its full content onto
+    ``handoff_json["green_change_set"]``, the same context-as-asset channel Phase A
+    already uses for approved XSDs (``xsd_files`` + ``materialize_files``), plus the
+    per-repo base SHA so a rebuild pins the SAME base the manifest recorded instead of
+    whatever the branch has drifted to.
+
+    The size cap is a safety limit, not a quality dial. A change-set too big to persist
+    is stored marked ``complete: False`` with the omitted paths NAMED, and
+    :func:`_rematerialize_green` then REFUSES it — a partial rebuild would push a subset
+    of a verified change, which is far worse than being told to re-run. Returns the
+    record, or None when snapshots are disabled / there is nothing to snapshot.
+    Fail-open: this must never turn a green build into a failure."""
+    from app.models.base import utcnow
+
+    cap = int(getattr(settings, "agentic_green_snapshot_max_bytes", 0) or 0)
+    if cap <= 0:
+        return None
+    try:
+        cs = _disk_change_set(db, run)
+        ops_in = [o for o in (getattr(cs, "operations", None) or []) if getattr(o, "path", None)]
+        if not ops_in:
+            return None
+        ops: list[dict] = []
+        omitted: list[str] = []
+        total = 0
+        # Deterministic order (repo, path) so the same tree always yields the same
+        # snapshot — and so "which files got omitted" is reproducible rather than
+        # dependent on filesystem walk order.
+        for o in sorted(ops_in, key=lambda x: (getattr(x, "repo_id", "") or "", x.path)):
+            content = getattr(o, "content", None)
+            if o.op == "delete":
+                ops.append({"op": "delete", "repo_id": o.repo_id, "path": o.path})
+                continue
+            if content is None:          # unreadable on disk — can't be rebuilt from here
+                omitted.append(f"{o.repo_id}:{o.path} (unreadable)")
+                continue
+            size = len(content.encode("utf-8", errors="replace"))
+            if total + size > cap:
+                omitted.append(f"{o.repo_id}:{o.path} ({size:,} bytes)")
+                continue
+            total += size
+            ops.append({"op": o.op, "repo_id": o.repo_id, "path": o.path, "content": content})
+        base_sha: dict[str, str] = {}
+        ws = _ws_id(run)
+        for rid in (run.selected_repo_ids or []):
+            try:
+                base_sha[rid] = workspace_local.read_base_sha(ws, rid)
+            except Exception:  # noqa: BLE001 — an absent base is reported, never guessed
+                pass
+        rec = {
+            "at": utcnow().isoformat(),
+            "files": len(ops),
+            "bytes": total,
+            "complete": not omitted,
+            "omitted": omitted[:40],
+            "omitted_total": len(omitted),
+            "base_sha": base_sha,
+            "feature_branch": (run.handoff_json or {}).get("feature_branch"),
+            "ops": ops,
+        }
+        h = dict(run.handoff_json or {})
+        h["green_change_set"] = rec
+        run.handoff_json = h
+        if omitted:
+            logger.warning("green snapshot run=%s INCOMPLETE: %d of %d file(s) omitted "
+                           "(cap %d bytes) — rebuild will refuse", run.id,
+                           len(omitted), len(ops_in), cap)
+            emit_event(db, run.id, "green_snapshot", {
+                "files": len(ops), "bytes": total, "complete": False,
+                "omitted": omitted[:10], "omitted_total": len(omitted),
+                "action": (f"⚠ Verified change only PARTLY saved ({len(ops)} of "
+                           f"{len(ops_in)} file(s); {len(omitted)} too large for the "
+                           f"{cap:,}-byte cap) — it cannot be rebuilt if the workspace "
+                           "is cleaned up. Raise AGENTIC_GREEN_SNAPSHOT_MAX_BYTES and "
+                           "re-verify to make it durable.")})
+        else:
+            emit_event(db, run.id, "green_snapshot", {
+                "files": len(ops), "bytes": total, "complete": True,
+                "action": (f"💾 Verified change saved ({len(ops)} file(s), {total:,} bytes) "
+                           "— it now survives a workspace cleanup")})
+        return rec
+    except Exception:  # noqa: BLE001 — durability is a bonus; never fail a GREEN build
+        logger.warning("green snapshot failed run=%s", run.id, exc_info=True)
+        return None
+
+
+def _rematerialize_green(db, run: AgenticRun, ws_id: str) -> dict:
+    """W6 — rebuild a lost workspace from the persisted GREEN change-set.
+
+    Mirrors ``_adopt_parent_workspace``'s GC-recovery path (re-clone → recreate the
+    feature branch → scrub the remote token → materialize the persisted files) and
+    inherits its loudness rule: if the snapshot cannot faithfully reproduce the verified
+    tree, REFUSE and say why. A rebuild that quietly lands a subset would push files a
+    human approved alongside files that silently vanished.
+
+    Returns ``{"ok": bool, "reason": str, "files": int}``; never raises."""
+    try:
+        rec = (getattr(run, "handoff_json", None) or {}).get("green_change_set") or {}
+        if not rec.get("ops"):
+            return {"ok": False, "files": 0,
+                    "reason": "no verified change-set was saved for this run (it predates "
+                              "green-state preservation, or snapshots were disabled) — "
+                              "re-run the change to rebuild it"}
+        if not rec.get("complete"):
+            return {"ok": False, "files": 0,
+                    "reason": (f"the saved change-set is INCOMPLETE ({rec.get('omitted_total')} "
+                               "file(s) exceeded the snapshot cap) — rebuilding it would land "
+                               "only part of a verified change. Re-run the change, or raise "
+                               "AGENTIC_GREEN_SNAPSHOT_MAX_BYTES and re-verify first")}
+        repos = repo_scope.validate_selection(db, run.selected_repo_ids)
+        base_sha = rec.get("base_sha") or {}
+        # Resolved LAZILY: the branch name is needed only to recreate it on a fresh
+        # clone, and the last fallback reads the change request from the DB. An adopted
+        # tree that is merely empty must not pay that query — nor depend on it.
+        branch = rec.get("feature_branch") or (run.handoff_json or {}).get("feature_branch")
+
+        def _branch() -> str:
+            # Deterministic: same title → same name, so a rebuilt tree lands on the
+            # branch the lost one was provisioned with.
+            return branch or agentic_push.branch_name(_title(db, run))
+        written = 0
+        for repo in repos:
+            rd = workspace_local.repo_dir(ws_id, repo.id)
+            if not (rd / ".git").exists():
+                gl = repo.gitlab_url or settings.gitlab_url
+                url = workspace_local.build_clone_url(gl, repo.gitlab_repo, settings.gitlab_token)
+                workspace_local.clone(ws_id, repo.id, url, repo.gitlab_branch)
+                workspace_local.create_branch(ws_id, repo.id, _branch())
+                # §22 — scrub the token from origin before anything can run git push.
+                workspace_local.set_remote(
+                    ws_id, repo.id, workspace_local.build_clone_url(gl, repo.gitlab_repo, ""))
+            # Pin the SAME base the verified change was built on. A fresh clone sits at
+            # the branch head, which may have moved since — rebuilding on top of that
+            # would silently re-base a human-approved change (and trip the push
+            # preflight's drift check, which is exactly the right alarm but the wrong
+            # time to hear it).
+            if base_sha.get(repo.id):
+                workspace_local.reset_to_base(ws_id, repo.id, base_sha[repo.id])
+            mine = [o for o in rec["ops"] if o.get("repo_id") == repo.id]
+            writes = [o for o in mine if o.get("op") != "delete"]
+            n = workspace_local.materialize_files(ws_id, repo.id, writes)
+            if n != len(writes):
+                return {"ok": False, "files": written + n,
+                        "reason": (f"rebuilt only {n} of {len(writes)} saved file(s) for "
+                                   f"{repo.gitlab_repo} — the workspace does not match the "
+                                   "verified change; re-run the change rather than trusting it")}
+            written += n
+            for o in (o for o in mine if o.get("op") == "delete"):
+                # The verified tree had this file REMOVED; a fresh clone has it back.
+                try:
+                    (rd / o["path"]).unlink(missing_ok=True)
+                except OSError as e:
+                    return {"ok": False, "files": written,
+                            "reason": (f"could not re-apply the deletion of {o['path']} in "
+                                       f"{repo.gitlab_repo} ({e}) — the rebuilt tree would "
+                                       "contain a file the verified change removed")}
+        emit_event(db, run.id, "green_rematerialized",
+                   {"files": written, "repos": len(repos), "branch": branch,  # None ⇒ adopted as-is
+                    "action": f"♻ Rebuilt the verified change from its saved snapshot — "
+                              f"{written} file(s) restored; no re-run needed"})
+        logger.info("green rebuild: run=%s ws=%s restored %d file(s)", run.id, ws_id, written)
+        return {"ok": True, "files": written, "reason": ""}
+    except Exception as e:  # noqa: BLE001 — report the failure; never raise into a push
+        logger.exception("green rebuild failed run=%s ws=%s", run.id, ws_id)
+        return {"ok": False, "files": 0,
+                "reason": f"rebuilding the verified change from its snapshot failed: {e}"}
+
+
 def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = True) -> str:
     """AUTHORITATIVE verification through the selected backend, against the DISK
     change-set (ground truth — covers continuations/resumes). Returns the status:
@@ -2229,6 +2407,9 @@ def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = Tr
         # than at freeze/approval so EVERY green verdict is recorded, including the
         # intermediate ones a later round goes on to regress and the on-demand re-verifies.
         _stamp_last_green(db, run, art, _attempt)
+        # W6 — and make the green tree itself durable, in the same breath. Verified work
+        # stops depending on a cache that the GC is free to collect.
+        _persist_green_change_set(db, run)
     if outcome.status == "unverified":
         # C4 — an unverified completion must be UNMISSABLE at the approval gate: this
         # change was NEVER BUILT. Persisted on the run (survives event scroll) and
@@ -2293,9 +2474,18 @@ def reverify_run(db, run_id: str) -> dict:
     ws = _ws_id(run)
     # The workspace (with the change applied) must still be on disk. After the TTL
     # GC it's gone — and we must NOT silently report "verified" off an empty
-    # change-set. Re-running the change is the only way to re-verify then.
+    # change-set.
+    #
+    # W6 — but "gone" no longer has to mean "re-run the whole change". If this run
+    # reached a green build, its change-set was persisted at that moment, so rebuild
+    # the tree from the snapshot and re-verify for real. A refusal (nothing saved, or
+    # saved incomplete) carries its own reason and still lands as `expired` — the one
+    # thing we never do is report a verdict off a tree we could not faithfully restore.
     if not workspace_local.run_dir(ws).exists():
-        return _record("expired", _REVERIFY_ACTION["expired"])
+        rebuilt = _rematerialize_green(db, run, ws)
+        if not rebuilt["ok"]:
+            return _record("expired", "the build workspace was cleaned up and "
+                                      + rebuilt["reason"])
 
     # Guard the false-positive: if the workspace exists but holds no change (e.g.
     # the tree was reset), build_plan would be empty and the verifier would return
@@ -2306,9 +2496,15 @@ def reverify_run(db, run_id: str) -> dict:
         logger.exception("reverify_run: change-set read failed run=%s", run_id)
         return _record("error", f"could not read the workspace change-set: {exc}")
     if not getattr(cs, "operations", None):
-        return _record("expired",
-                       "no change found on disk to build (the workspace may have been "
-                       "reset) — re-run the change to verify it again")
+        # Same recovery for a tree that exists but was emptied (reset/partial GC).
+        rebuilt = _rematerialize_green(db, run, ws)
+        if rebuilt["ok"]:
+            cs = _disk_change_set(db, run)
+        if not getattr(cs, "operations", None):
+            return _record("expired",
+                           "no change found on disk to build (the workspace may have been "
+                           "reset) and " + (rebuilt["reason"] or "it could not be rebuilt")
+                           + " — re-run the change to verify it again")
 
     try:
         art: dict = {}
@@ -4417,6 +4613,32 @@ async def push_run(db, run_id: str, *, owner: str = "orchestrator") -> dict:
         "; ".join(f"{r.repo_id[:8]}:{r.push_state or 'pending'}"
                   f"@{(r.pushed_manifest_hash or '?')[:12]} on {r.branch or '-'}"
                   for r in _rows) or "none")
+    # W6 — the approved tree may have been COLLECTED between approval and push (the
+    # deferred-push gap is hours, the workspace TTL is not). Without a rebuild, `_read`
+    # below returns None for every file and the content preflight fails as "base SHA
+    # drift" — a verified, human-approved change lost to a cache eviction, reported as
+    # something it wasn't. Rebuild from the green snapshot first; if that refuses, fail
+    # with ITS reason (precise and actionable) rather than the misleading drift message.
+    if not workspace_local.run_dir(ws_id).exists():
+        logger.warning("push_run: run=%s workspace %s is GONE — rebuilding from the "
+                       "verified snapshot", run_id, ws_id)
+        emit_event(db, run_id, "workspace_missing",
+                   {"at": "push", "action": "📦 Approved workspace was cleaned up — "
+                                            "rebuilding it from the verified change"})
+        db.commit()
+        _rebuilt = _rematerialize_green(db, run, ws_id)
+        if not _rebuilt["ok"]:
+            _msg = ("the approved workspace was cleaned up before the push and "
+                    + _rebuilt["reason"])
+            logger.error("push_run: run=%s cannot rebuild: %s", run_id, _msg)
+            _commit_terminal(db, run_id, _msg, error_code="WORKSPACE_EXPIRED")
+            emit_event(db, run_id, "push_preflight_failed",
+                       {"reasons": [_msg], "drift": False, "workspace_expired": True})
+            db.commit()
+            _hb_stop.set(); S.release_lease(db, run_id, owner); db.commit()
+            await _distill_lessons(db, run_id, outcome="failed")      # W4
+            return {"pushed": False, "reason": _msg}
+        db.commit()
     # A prior FAILED push can leave its own commit on the tree (checkout -B + commit ran
     # before the push was rejected), advancing HEAD past the recorded base → the preflight
     # below reads that as drift and loops in rebase_reverify forever. Undo it first.

@@ -277,6 +277,31 @@ colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
    totals kept and the truncation NAMED, paths match by basename (the same coarse matching
    the review floor uses, since plans name full paths and the diff is repo-relative), and
    an unknown stop reason degrades to the raw token rather than vanishing. Fail-open.
+6. ✅ **Green-state preservation** — verified-but-unpushed work lived in exactly ONE
+   place: the on-disk clone. The hourly workspace GC collects it, and a human-approved,
+   build-verified change was then destroyed by a cache eviction — `reverify_run`
+   answered "expired … re-run the change", and a push whose tree was collected during
+   the deferred-push gap failed its content preflight reported as "base SHA drift",
+   which it wasn't. Now every GREEN verify calls `_persist_green_change_set`: the whole
+   disk change-set (paths + CONTENT, deletes recorded without content) goes onto
+   `handoff_json["green_change_set"]` with the per-repo base SHA and feature branch —
+   the same context-as-asset channel Phase A already uses for approved XSDs. Ordered
+   by (repo, path) so the same tree yields the same snapshot and omissions are
+   reproducible. `_rematerialize_green` rebuilds a lost tree (re-clone → recreate the
+   branch → scrub the remote token → `reset_to_base` to the RECORDED base, not the
+   drifted branch head → materialize files → re-apply deletions a fresh clone would
+   restore), mirroring `_adopt_parent_workspace`'s GC-recovery path. Wired into both
+   `reverify_run` expired paths and into `push_run` before the content preflight.
+   The safety rule is absolute: it REFUSES rather than rebuild a tree it cannot
+   faithfully reproduce — nothing saved, snapshot marked incomplete, a short write, or
+   an un-appliable deletion each return a precise reason, because landing a subset of a
+   verified change is far worse than being told to re-run. `agentic_green_snapshot_max_bytes`
+   (default 4 MB, 0 disables) is a safety limit, not a quality dial: an oversized
+   change-set is stored `complete: False` with the omitted paths and their sizes NAMED
+   and the knob named in the event, and the rebuild then refuses it. `_run_view` exposes
+   a `green_snapshot` header with the `ops` payload STRIPPED (megabytes of file content
+   have no business in a status response). Fail-open: a snapshot miss never fails a
+   green build, and a rebuild never raises into a push.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 

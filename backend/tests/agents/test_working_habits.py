@@ -695,3 +695,232 @@ def test_run_view_surfaces_the_stop_report(monkeypatch):
     assert A._run_view(run)["stop_report"] == rec
     run.handoff_json = {}
     assert A._run_view(run)["stop_report"] is None, "a clean phase reports nothing"
+
+
+# ── W6: green-state preservation ─────────────────────────────────────────────────
+
+def _op(path, content="x", op="modify", repo="repo-1"):
+    return SimpleNamespace(op=op, repo_id=repo, path=path, content=content,
+                           content_hash="h")
+
+
+def _snap(monkeypatch, ops, *, cap=4_000_000, base_sha="abc123"):
+    from app.agents import agentic_orchestrator as O
+    events = []
+    monkeypatch.setattr(O, "emit_event",
+                        lambda db, rid, kind, payload=None: events.append((kind, payload)))
+    monkeypatch.setattr(O, "_disk_change_set", lambda db, run: SimpleNamespace(operations=ops))
+    monkeypatch.setattr(O, "_ws_id", lambda run: "ws-1")
+    monkeypatch.setattr(O.workspace_local, "read_base_sha", lambda ws, rid: base_sha)
+    monkeypatch.setattr(settings, "agentic_green_snapshot_max_bytes", cap)
+    run = SimpleNamespace(id="run-x", selected_repo_ids=["repo-1"],
+                          handoff_json={"feature_branch": "feat/x"})
+    rec = O._persist_green_change_set(None, run)
+    return run, rec, events
+
+
+def test_a_green_verify_makes_the_change_set_durable(monkeypatch):
+    run, rec, events = _snap(monkeypatch, [_op("src/A.java", "class A {}"),
+                                           _op("src/B.java", "class B {}")])
+    assert rec["complete"] is True and rec["files"] == 2
+    assert rec["base_sha"] == {"repo-1": "abc123"}, "pins the base the change was built on"
+    assert rec["feature_branch"] == "feat/x"
+    assert {o["path"] for o in rec["ops"]} == {"src/A.java", "src/B.java"}
+    assert any(o["content"] == "class A {}" for o in rec["ops"]), "content, not just paths"
+    assert run.handoff_json["green_change_set"] == rec
+    assert "survives a workspace cleanup" in [p for k, p in events
+                                              if k == "green_snapshot"][0]["action"]
+
+
+def test_snapshot_records_deletes_without_content(monkeypatch):
+    _, rec, _ = _snap(monkeypatch, [_op("src/Gone.java", None, op="delete")])
+    assert rec["ops"] == [{"op": "delete", "repo_id": "repo-1", "path": "src/Gone.java"}]
+    assert rec["complete"] is True
+
+
+def test_an_oversized_change_set_is_marked_incomplete_and_names_what_was_dropped(monkeypatch):
+    _, rec, events = _snap(monkeypatch, [_op("src/A.java", "a" * 100),
+                                         _op("src/Big.java", "b" * 5000)], cap=1000)
+    assert rec["complete"] is False and rec["files"] == 1
+    assert rec["omitted_total"] == 1 and "src/Big.java" in rec["omitted"][0]
+    assert "5,000 bytes" in rec["omitted"][0], "says HOW big, so the cap can be set"
+    payload = [p for k, p in events if k == "green_snapshot"][0]
+    assert payload["complete"] is False
+    assert "only PARTLY saved" in payload["action"]
+    assert "AGENTIC_GREEN_SNAPSHOT_MAX_BYTES" in payload["action"], "names the knob"
+
+
+def test_snapshot_ordering_is_deterministic_so_omissions_are_reproducible(monkeypatch):
+    ops = [_op("src/Z.java", "z" * 400), _op("src/A.java", "a" * 400)]
+    _, first, _ = _snap(monkeypatch, ops, cap=500)
+    _, second, _ = _snap(monkeypatch, list(reversed(ops)), cap=500)
+    assert [o["path"] for o in first["ops"]] == [o["path"] for o in second["ops"]] \
+        == ["src/A.java"], "same tree → same snapshot, regardless of walk order"
+
+
+def test_snapshots_can_be_disabled_and_an_empty_tree_snapshots_nothing(monkeypatch):
+    _, rec, events = _snap(monkeypatch, [_op("src/A.java")], cap=0)
+    assert rec is None and not events
+    _, empty, _ = _snap(monkeypatch, [])
+    assert empty is None
+
+
+def test_a_snapshot_failure_never_fails_a_green_build(monkeypatch):
+    from app.agents import agentic_orchestrator as O
+    monkeypatch.setattr(O, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(O, "_disk_change_set", lambda db, run: 1 / 0)
+    monkeypatch.setattr(settings, "agentic_green_snapshot_max_bytes", 1000)
+    assert O._persist_green_change_set(None, SimpleNamespace(
+        id="r", selected_repo_ids=[], handoff_json={})) is None
+
+
+def _rebuild(monkeypatch, tmp_path, handoff, *, cloned=True, mat=None):
+    from app.agents import agentic_orchestrator as O
+    events, calls = [], []
+    rd = tmp_path / "ws-1" / "repo-1"
+    rd.mkdir(parents=True, exist_ok=True)
+    if cloned:
+        (rd / ".git").mkdir(exist_ok=True)
+    monkeypatch.setattr(O, "emit_event",
+                        lambda db, rid, kind, payload=None: events.append((kind, payload)))
+    monkeypatch.setattr(O.repo_scope, "validate_selection", lambda db, ids: [
+        SimpleNamespace(id="repo-1", gitlab_repo="grp/repo", gitlab_branch="main",
+                        gitlab_url=None)])
+    monkeypatch.setattr(O.workspace_local, "repo_dir", lambda ws, rid: rd)
+    monkeypatch.setattr(O.workspace_local, "clone",
+                        lambda *a, **k: calls.append("clone") or "sha")
+    monkeypatch.setattr(O.workspace_local, "create_branch", lambda *a, **k: None)
+    monkeypatch.setattr(O.workspace_local, "set_remote", lambda *a, **k: None)
+    monkeypatch.setattr(O.workspace_local, "build_clone_url", lambda *a, **k: "url")
+    monkeypatch.setattr(O.workspace_local, "reset_to_base",
+                        lambda ws, rid, sha: calls.append(f"reset:{sha}"))
+
+    def _mat(ws, rid, files):
+        for f in files:
+            p = rd / f["path"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f["content"])
+        return len(files)
+    monkeypatch.setattr(O.workspace_local, "materialize_files", mat or _mat)
+    run = SimpleNamespace(id="run-x", selected_repo_ids=["repo-1"], handoff_json=handoff,
+                          change_request_id="cr")
+    return O._rematerialize_green(None, run, "ws-1"), rd, events, calls
+
+
+def test_a_lost_workspace_is_rebuilt_from_the_snapshot(monkeypatch, tmp_path):
+    handoff = {"green_change_set": {
+        "complete": True, "base_sha": {"repo-1": "base9"}, "feature_branch": "feat/x",
+        "ops": [{"op": "modify", "repo_id": "repo-1", "path": "src/A.java",
+                 "content": "class A {}"}]}}
+    res, rd, events, calls = _rebuild(monkeypatch, tmp_path, handoff, cloned=False)
+    assert res["ok"] is True and res["files"] == 1
+    assert (rd / "src" / "A.java").read_text() == "class A {}"
+    assert "clone" in calls, "no .git → re-clone"
+    assert "reset:base9" in calls, "pins the base the verified change was built on"
+    assert "no re-run needed" in [p for k, p in events if k == "green_rematerialized"][0]["action"]
+
+
+def test_rebuild_reapplies_deletions_a_fresh_clone_would_restore(monkeypatch, tmp_path):
+    # The verified tree had this file REMOVED. A clone brings it back, so the rebuild
+    # has to delete it again or the pushed change silently gains a file back.
+    handoff = {"green_change_set": {
+        "complete": True, "base_sha": {}, "ops": [
+            {"op": "delete", "repo_id": "repo-1", "path": "src/Gone.java"}]}}
+    rd = tmp_path / "ws-1" / "repo-1"
+    (rd / "src").mkdir(parents=True)
+    (rd / "src" / "Gone.java").write_text("class Gone {}")
+    res, rd, _, _ = _rebuild(monkeypatch, tmp_path, handoff)
+    assert res["ok"] is True
+    assert not (rd / "src" / "Gone.java").exists()
+
+
+def test_rebuild_tolerates_an_already_absent_deletion(monkeypatch, tmp_path):
+    handoff = {"green_change_set": {
+        "complete": True, "base_sha": {}, "ops": [
+            {"op": "delete", "repo_id": "repo-1", "path": "src/NeverThere.java"}]}}
+    assert _rebuild(monkeypatch, tmp_path, handoff)[0]["ok"] is True
+
+
+def test_rebuild_refuses_an_incomplete_snapshot_rather_than_pushing_a_subset(monkeypatch, tmp_path):
+    handoff = {"green_change_set": {"complete": False, "omitted_total": 3, "ops": [
+        {"op": "modify", "repo_id": "repo-1", "path": "src/A.java", "content": "a"}]}}
+    res, _, _, _ = _rebuild(monkeypatch, tmp_path, handoff)
+    assert res["ok"] is False
+    assert "INCOMPLETE" in res["reason"] and "3 file(s)" in res["reason"]
+    assert "only part of a verified change" in res["reason"]
+    assert "AGENTIC_GREEN_SNAPSHOT_MAX_BYTES" in res["reason"]
+
+
+def test_rebuild_refuses_when_nothing_was_ever_saved(monkeypatch, tmp_path):
+    res, _, _, _ = _rebuild(monkeypatch, tmp_path, {})
+    assert res["ok"] is False and "no verified change-set was saved" in res["reason"]
+    assert "re-run the change" in res["reason"]
+
+
+def test_rebuild_refuses_on_a_short_write_rather_than_claiming_success(monkeypatch, tmp_path):
+    from app.agents import agentic_orchestrator as O
+    handoff = {"green_change_set": {"complete": True, "base_sha": {}, "ops": [
+        {"op": "modify", "repo_id": "repo-1", "path": "src/A.java", "content": "a"},
+        {"op": "modify", "repo_id": "repo-1", "path": "src/B.java", "content": "b"}]}}
+    assert _rebuild(monkeypatch, tmp_path, handoff)[0]["ok"] is True      # control
+    # Now let the write come up short — the same shape as the Phase-A XSD restore guard.
+    res, _, _, _ = _rebuild(monkeypatch, tmp_path, handoff,
+                            mat=lambda ws, rid, files: 1)
+    assert res["ok"] is False and "rebuilt only 1 of 2" in res["reason"]
+    assert "re-run the change rather than trusting it" in res["reason"]
+
+
+def test_rebuild_never_raises(monkeypatch, tmp_path):
+    from app.agents import agentic_orchestrator as O
+    monkeypatch.setattr(O, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(O.repo_scope, "validate_selection", lambda db, ids: 1 / 0)
+    res = O._rematerialize_green(None, SimpleNamespace(
+        id="r", selected_repo_ids=["repo-1"], change_request_id="cr",
+        handoff_json={"green_change_set": {"complete": True, "ops": [{"path": "a"}]}}), "ws")
+    assert res["ok"] is False and "failed" in res["reason"]
+
+
+def test_reverify_rebuilds_a_collected_workspace_instead_of_giving_up(monkeypatch):
+    from app.agents import agentic_orchestrator as O
+    run = SimpleNamespace(id="r", handoff_json={}, selected_repo_ids=["repo-1"])
+    monkeypatch.setattr(O, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(O.workspace_local, "run_dir",
+                        lambda ws: SimpleNamespace(exists=lambda: False))
+    monkeypatch.setattr(O, "_ws_id", lambda r: "ws")
+
+    db = SimpleNamespace(get=lambda _m, _i: run, commit=lambda: None)
+    # refusal → still `expired`, but carrying the precise reason
+    monkeypatch.setattr(O, "_rematerialize_green",
+                        lambda db_, r, ws: {"ok": False, "files": 0,
+                                            "reason": "the saved change-set is INCOMPLETE"})
+    out = O.reverify_run(db, "r")
+    assert out["status"] == "expired" and "INCOMPLETE" in out["reason"]
+    assert "cleaned up" in out["reason"]
+
+    # success → the real build runs against the rebuilt tree
+    monkeypatch.setattr(O, "_rematerialize_green",
+                        lambda db_, r, ws: {"ok": True, "files": 2, "reason": ""})
+    monkeypatch.setattr(O, "_disk_change_set", lambda db_, r: SimpleNamespace(
+        operations=[_op("src/A.java")]))
+    monkeypatch.setattr(O, "_phase_verify", lambda db_, r, art: art.setdefault(
+        "verification", {"status": "verified", "modules": {}, "reason": ""}) and "verified")
+    assert O.reverify_run(db, "r")["status"] == "verified"
+
+
+def test_run_view_reports_snapshot_durability_without_the_file_contents(monkeypatch):
+    import app.api.agentic as A
+    monkeypatch.setattr(A, "_push_view", lambda run: {})
+    run = SimpleNamespace(
+        id="r", change_request_id="c", phase="verify", status="running",
+        manifest_hash=None, cancel_requested=False, error=None, error_code=None,
+        created_by=None, kind="code", parent_run_id=None, selected_repo_ids=[],
+        handoff_json={"green_change_set": {
+            "at": "t", "files": 2, "bytes": 99, "complete": True, "omitted": [],
+            "omitted_total": 0,
+            "ops": [{"path": "a", "content": "x" * 10_000}]}})
+    view = A._run_view(run)["green_snapshot"]
+    assert view == {"at": "t", "files": 2, "bytes": 99, "complete": True,
+                    "omitted": [], "omitted_total": 0}
+    assert "ops" not in view, "megabytes of file content never ride a status response"
+    run.handoff_json = {}
+    assert A._run_view(run)["green_snapshot"] is None
