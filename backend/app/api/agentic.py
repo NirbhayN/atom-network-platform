@@ -188,7 +188,21 @@ def _run_view(run: AgenticRun) -> dict:
             # vs touched files both ways, last verify verdict, last green, fact and
             # execution counts, and an `action` line that says what to trust. None on a
             # phase that finished cleanly.
-            "stop_report": (getattr(run, "handoff_json", None) or {}).get("stop_report")}
+            "stop_report": (getattr(run, "handoff_json", None) or {}).get("stop_report"),
+            # W6 — is the verified change durable? {at, files, bytes, complete} with the
+            # `ops` payload stripped (it carries whole file contents — megabytes have no
+            # business in a run-status response). `complete: false` is the one a human
+            # must act on: the change would NOT survive a workspace cleanup.
+            "green_snapshot": _green_snapshot_view(run)}
+
+
+def _green_snapshot_view(run: AgenticRun) -> dict | None:
+    """The green-snapshot header WITHOUT its file contents (W6)."""
+    rec = (getattr(run, "handoff_json", None) or {}).get("green_change_set")
+    if not isinstance(rec, dict):
+        return None
+    return {k: rec.get(k) for k in ("at", "files", "bytes", "complete",
+                                    "omitted", "omitted_total")}
 
 
 def _approved_xsd_run(db: Session, change_id: str) -> AgenticRun | None:
