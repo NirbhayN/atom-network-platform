@@ -155,6 +155,14 @@ class RunContext:
     # costs a prompt-cache re-read).
     facts: list[dict] = field(default_factory=list)
     facts_rev: int = 0
+    # W1 — BUDGET VISIBILITY. The harness knows this run's cost-weighted token spend and
+    # the enforced hard cap; the model knows neither, so it cannot tell a run with room
+    # left from one about to be soft-stopped between two halves of a multi-file change.
+    # The loop refreshes these each iteration from the durable ledger and renders them
+    # into the pinned GROUND TRUTH block. Harness-measured — never a model claim.
+    budget_spent: int = 0            # cost-weighted tokens charged to this run so far
+    budget_cap: int = 0              # the ENFORCED hard cap (0 = no cap configured)
+    budget_used_pct: int | None = None   # None until the loop takes its first reading
 
     def changeset(self) -> list[FileOp]:
         return list(self.file_ops.values())

@@ -610,6 +610,35 @@ def _note_unsummarized_eviction(messages: list[dict]) -> None:
 
 _STATE_MAX_FILES = 60
 
+# W1 — how coarsely the budget reading is re-pinned. Every re-pin rewrites messages[0]
+# and therefore costs one prompt-cache re-read, so the line refreshes per 10%-bucket
+# (≤10 extra re-reads over a whole run) rather than per iteration. The model needs the
+# magnitude to sequence its work, not three significant figures.
+_BUDGET_PIN_STEP = 10
+
+
+def _budget_state_line(ctx) -> str | None:
+    """W1 — the harness's own budget reading, as a line for the GROUND TRUTH block.
+
+    The token hard cap is one of the three real stop conditions (build verdict, token
+    budget, human approval), and it lands as a *soft stop between turns* — whatever is
+    half-finished on disk at that moment is what the next person inherits. An agent told
+    "~80% used" can finish and verify the slice in flight before opening another; an
+    agent told nothing discovers the ceiling by being stopped. Returns None when no cap
+    is configured (nothing to report) or before the loop's first reading."""
+    pct = getattr(ctx, "budget_used_pct", None)
+    cap = int(getattr(ctx, "budget_cap", 0) or 0)
+    if pct is None or cap <= 0:
+        return None
+    spent = int(getattr(ctx, "budget_spent", 0) or 0)
+    advice = ("Little room left — STOP opening new work. Finish, verify and report on "
+              "what is already edited; leave the tree compiling."
+              if pct >= 70 else
+              "Sequence DURABLE work first: land a slice that compiles, verify it, then "
+              "open the next one — a stop between turns keeps whatever is on disk.")
+    return (f"Run token budget: ~{pct}% used ({spent:,} of {cap:,} cost-weighted, "
+            f"harness-measured). The run is STOPPED at 100%. {advice}")
+
 
 def _pin_ground_truth(messages: list[dict], ctx) -> None:
     """After compaction, re-inject the harness's DETERMINISTIC record of this run's state into
@@ -622,6 +651,9 @@ def _pin_ground_truth(messages: list[dict], ctx) -> None:
         if not isinstance(base, str):
             return
         lines: list[str] = []
+        _budget = _budget_state_line(ctx)
+        if _budget:
+            lines.append(_budget)
         ops = list(ctx.file_ops.values())
         if ops:
             lines.append(f"Files changed this run ({len(ops)}) — these edits EXIST on disk; "
@@ -945,6 +977,24 @@ async def run_agent_loop(
                              "sheet": _head(T.format_facts(ctx.facts)),
                              "action": f"📌 fact sheet updated — {len(ctx.facts)} fact(s) on record"})
 
+    def _sync_budget_state(spent: int, cap: int, iteration: int) -> None:
+        """W1 — record the harness's budget reading on ctx and re-pin the brief when the
+        magnitude has actually moved. Bucket-gated for the same reason _sync_fact_sheet is
+        rev-gated: rewriting messages[0] costs a prompt-cache re-read, so a per-iteration
+        re-pin would pay that on every turn to restate a number that barely changed.
+        Deliberately NOT emitted as an event — the budget warn/exceeded events already
+        cover the operator-facing story; this exists to inform the MODEL."""
+        nonlocal budget_bucket_pinned
+        ctx.budget_spent, ctx.budget_cap = spent, cap
+        ctx.budget_used_pct = min(int(100.0 * spent / cap), 100) if cap > 0 else None
+        bucket = (ctx.budget_used_pct or 0) // _BUDGET_PIN_STEP
+        if cap <= 0 or bucket <= budget_bucket_pinned:
+            return
+        budget_bucket_pinned = bucket
+        _pin_ground_truth(messages, ctx)
+        logger.info("agent_loop[%s] run=%s iter=%d budget pinned at ~%d%% (%d/%d weighted)",
+                    agent_name, run_id, iteration, ctx.budget_used_pct, spent, cap)
+
     stopped = "max_iterations"
     final_text = ""
     cumulative_tokens = 0                 # tracked for telemetry only — NOT a fail condition
@@ -958,6 +1008,7 @@ async def run_agent_loop(
     iters_since_edit = 0                  # harness-truth exploration counter (code phase)
     prev_ops_n = 0
     facts_rev_pinned = getattr(ctx, "facts_rev", 0)   # fact-sheet revision last pinned into the brief
+    budget_bucket_pinned = -1             # W1: last budget 10%-bucket written into the brief
     # Fixed per-call prompt overhead the provider tokenizes but the message array doesn't
     # carry: system segments + tool schemas. Feeds the UNanchored estimate below (a
     # usage-stripping provider never anchors, so without this the preflight undercounts).
@@ -1046,6 +1097,13 @@ async def run_agent_loop(
             _bd = get_run_token_breakdown(run_id)
             _run_total = _bd["weighted_total"]
             _warn_frac = float(getattr(settings, "agentic_token_budget_warn_fraction", 0.8))
+            # W1 — the guard already holds the ONLY authoritative reading of spend-vs-cap in
+            # the whole loop. Hand it to the model here (pinned ground truth) instead of
+            # letting the cap arrive as an unexplained stop: the operator-facing warn/exceeded
+            # events below are read by humans AFTER the fact, which is too late to change how
+            # the agent sequenced its work. Taken before the stop check so the final turn's
+            # brief is honest even on the turn the budget runs out.
+            _sync_budget_state(_run_total, _budget_cap, i)
             if _run_total >= _budget_cap and getattr(settings, "agentic_token_budget_enforce", True):
                 logger.error("agent_loop[%s] run=%s TOKEN BUDGET EXCEEDED: weighted %d >= cap %d "
                              "(in=%d out=%d cache_read=%d cache_write=%d) — stopping before the "

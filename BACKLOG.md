@@ -184,6 +184,30 @@ Master list from the 2026-10-30 accuracy audit + slipstream work. Status:
    metrics now report scout adoption and `context_reclaimed_chars` (compaction +
    supersede-eviction) — the context-discipline work is measurable.
 
+## G. Working habits (third pass, 2026-11-03)
+
+Seven mechanisms that encode three rules: **stop-safe at any moment**, **every claim
+checkable**, **never leave the build broken**. Code labels are `W1`…`W7` — section F's
+items carry the `G1`…`G7` labels in code, so this batch takes its own prefix rather than
+colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
+
+1. ✅ **Budget visibility** — the token hard cap is one of the three real stop conditions,
+   and it lands as a soft stop *between turns*: whatever is half-finished on disk at that
+   moment is what the next person inherits. The loop's budget guard already held the only
+   authoritative spend-vs-cap reading in the system (the cost-weighted ledger total it
+   stops on); it now hands that reading to the MODEL as a line in the pinned GROUND TRUTH
+   block — "~N% used (X of Y cost-weighted, harness-measured); the run is STOPPED at
+   100%" — plus sequencing advice that flips at 70% from "land a slice that compiles,
+   verify it, then open the next" to "STOP opening new work; finish and verify what is
+   already edited". Harness-measured, never a model claim, and read from the SAME query
+   the hard stop uses, so the number the agent sees can't disagree with the number that
+   kills it. Re-pinned per 10% bucket (`_BUDGET_PIN_STEP`), mirroring `_sync_fact_sheet`'s
+   rev-gating — a re-pin rewrites `messages[0]` and costs a prompt-cache re-read, so a
+   flat spend doesn't pay it every turn. The reading is taken BEFORE the stop check, so
+   the brief in the persisted transcript is honest even on the turn the cap trips. Inert
+   when no cap is configured. `RunContext.budget_{spent,cap,used_pct}` +
+   `_budget_state_line` + `_sync_budget_state`.
+
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 
 - Per-module Java detection (legacy `1.8` ≡ `8`, property-aware, nested poms),
