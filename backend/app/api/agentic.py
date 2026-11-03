@@ -182,7 +182,13 @@ def _run_view(run: AgenticRun) -> dict:
             # returning here after a later regression means reverting to the checkpoint
             # taken BEFORE that later round. None until a verify first passes — a run
             # showing none has no known-good state recorded to fall back to.
-            "last_green_ckpt": (getattr(run, "handoff_json", None) or {}).get("last_green_ckpt")}
+            "last_green_ckpt": (getattr(run, "handoff_json", None) or {}).get("last_green_ckpt"),
+            # W5 — present only when the code phase stopped SHORT (capped / budget /
+            # no-progress): the deterministic record of what was left behind — planned
+            # vs touched files both ways, last verify verdict, last green, fact and
+            # execution counts, and an `action` line that says what to trust. None on a
+            # phase that finished cleanly.
+            "stop_report": (getattr(run, "handoff_json", None) or {}).get("stop_report")}
 
 
 def _approved_xsd_run(db: Session, change_id: str) -> AgenticRun | None:

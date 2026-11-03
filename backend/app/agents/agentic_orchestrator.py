@@ -1436,6 +1436,123 @@ def _basename(p: str | None) -> str:
     return (p or "").replace("\\", "/").rstrip("/").split("/")[-1].lower()
 
 
+_STOP_REPORT_MAX_FILES = 40
+
+
+def _stop_report(db, run: AgenticRun, art: dict, cs, *, reason: str, rounds: int) -> dict:
+    """W5 — what a NON-COMPLETE code phase actually left behind. Deterministic; no LLM.
+
+    When the code phase stops short — turns capped, continuation budget spent, token
+    budget exhausted, two rounds with no progress — the edits stay on disk and the run
+    carries on to verify/review. What nobody could answer was the only question that
+    matters next: *how much of this is finished, and what of it can I trust?* The
+    evidence existed, scattered across the ratified plan, the disk diff, the last
+    verification payload, the green pointer and the fact sheet, so the next person
+    reassembled it by hand from the event log — or guessed.
+
+    Assembled from HARNESS records only, never the agent's closing prose: planned files
+    (the ratified plan, with the agent's own submitted plan as the fallback on legacy
+    runs that have no analysis) versus files actually touched on disk, the gap between
+    them both ways, the last verify verdict, the last-green pointer (W3), the fact count,
+    and the execution count (W2). Lists are capped and the overflow is NAMED, so a
+    truncated report can never read as a complete one.
+
+    Returns the record (also persisted + emitted by the caller). Fail-open: a report is
+    worth having, never worth failing a phase for."""
+    from app.models.base import utcnow
+
+    ops = list(getattr(cs, "operations", None) or [])
+    touched = [o.path for o in ops if getattr(o, "path", None)]
+    # Planned surface: the ratified analysis is the binding spec; the agent's own
+    # submit_plan is the fallback for legacy runs that never had one.
+    planned: list[str] = []
+    try:
+        ca = _latest_ratified_analysis(db, run.change_request_id) if db is not None else None
+        planned = [p for p, _ in _plan_file_entries(ca.technical_analysis if ca else None)]
+    except Exception:  # noqa: BLE001 — a missing plan is reported as unknown, not as zero
+        planned = []
+    planned_source = "ratified_plan"
+    if not planned:
+        planned = [str((f or {}).get("path") or "") for f in ((getattr(cs, "plan", None) or {})
+                                                              .get("files") or [])
+                   if isinstance(f, dict) and (f or {}).get("path")]
+        planned_source = "agent_plan" if planned else "none"
+    _tset = {_basename(t) for t in touched if t}
+    _pset = {_basename(p) for p in planned if p}
+    missing = sorted({p for p in planned if p and _basename(p) not in _tset})
+    extra = sorted({t for t in touched if t and _pset and _basename(t) not in _pset})
+    v = art.get("verification") or {}
+    green = (art.get("last_green_ckpt")
+             or (getattr(run, "handoff_json", None) or {}).get("last_green_ckpt"))
+    rec = {
+        "reason": reason,
+        "rounds": rounds,
+        "at": utcnow().isoformat(),
+        "planned_source": planned_source,
+        "planned": len(planned),
+        "touched": len(touched),
+        "planned_not_touched": missing[:_STOP_REPORT_MAX_FILES],
+        "planned_not_touched_total": len(missing),
+        "touched_not_planned": extra[:_STOP_REPORT_MAX_FILES],
+        "touched_not_planned_total": len(extra),
+        # "never built" is a DIFFERENT state from "built and failed" — don't collapse them.
+        "verify_status": v.get("status") or "never_built",
+        "verify_errors": len(v.get("errors") or []),
+        "last_green": ({"label": green.get("label"), "at": green.get("at"),
+                        "files": green.get("files")} if isinstance(green, dict) else None),
+        "facts": len((getattr(run, "handoff_json", None) or {}).get("facts") or []),
+        "executions": int(art.get("executions") or 0),
+    }
+    if len(missing) > _STOP_REPORT_MAX_FILES or len(extra) > _STOP_REPORT_MAX_FILES:
+        rec["truncated"] = (f"file lists capped at {_STOP_REPORT_MAX_FILES}; the totals "
+                            "are exact — read the frozen diff for the full set")
+    rec["action"] = _stop_report_line(rec)
+    return rec
+
+
+_STOP_REASON_WORDS = {
+    "budget_exceeded": "ran out of token budget",
+    "no_progress": "stopped not converging (two rounds, zero edits)",
+    "continuations_exhausted": "ran out of continuation rounds",
+    "loop_capped": "stopped at a loop cap",
+}
+
+
+def _stop_report_line(rec: dict) -> str:
+    """The one line a human reads first: what stopped, how far it got, what to trust.
+
+    Says "trust nothing yet" where that is the truth — a stop report whose cheeriness
+    outruns its evidence is worse than none, because it gets believed."""
+    why = _STOP_REASON_WORDS.get(rec.get("reason"), str(rec.get("reason") or "stopped"))
+    bits = [f"⏹ Code phase {why} after {rec.get('rounds')} round(s): "
+            f"{rec.get('touched')} file(s) edited"]
+    if rec.get("planned_source") == "none":
+        bits.append("no plan on record to compare against")
+    elif rec.get("planned_not_touched_total"):
+        bits.append(f"{rec['planned_not_touched_total']} planned file(s) NEVER touched "
+                    f"({', '.join(rec['planned_not_touched'][:5])}"
+                    + (", …" if rec["planned_not_touched_total"] > 5 else "") + ")")
+    else:
+        bits.append("every planned file was touched")
+    status = rec.get("verify_status")
+    if status == "never_built":
+        bits.append("NEVER BUILT — trust nothing here until it is verified")
+    elif status == "verified":
+        bits.append("last build GREEN")
+    elif status == "needs_fix":
+        bits.append(f"last build FAILED ({rec.get('verify_errors')} error(s))")
+    else:
+        bits.append(f"last build {status}")
+    g = rec.get("last_green")
+    bits.append(f"last green at {g['label']} ({g.get('files')} file(s))"
+                if isinstance(g, dict) and g.get("label")
+                else ("a green build was recorded but not to a round label"
+                      if isinstance(g, dict) else "NO green build was ever reached"))
+    if not rec.get("executions"):
+        bits.append("the agent never ran a build or test itself")
+    return " · ".join(bits)
+
+
 def _untouched_review_files(flagged: list[str], touched: list[str]) -> list[str]:
     """Reviewer-flagged files (by basename) that the change never touched. Pure set logic so it is
     unit-testable; the caller feeds it disk truth. Empty entries (behavioural findings with no file)
@@ -1588,6 +1705,7 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
     gap_redrives = 0                 # bounded: drive completion rounds if the plan isn't done
     review_redrives = 0              # bounded: drive completion rounds when reviewer-flagged files stay untouched
     no_progress_rounds = 0           # consecutive CAPPED rounds with zero file edits (abort at 2)
+    _stop_reason = ""                # W5: set by the NON-COMPLETE stop paths; "" = finished clean
     cs = None
     # Binding Decision Ledger (S7) — same for every continuation round.
     try:
@@ -1739,6 +1857,7 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
                         "⛔ Run token budget exhausted — stopping the code phase "
                         "(edits made so far remain on disk; re-run with a raised "
                         "AGENTIC_TOKEN_BUDGET_HARD_CAP to continue)"})
+            _stop_reason = "budget_exceeded"          # W5
             break
         if cs.stopped == "max_iterations":
             # No-progress abort: TWO consecutive capped rounds with zero file edits means the
@@ -1753,11 +1872,13 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
                            {"continuations": round_i + 1, "no_progress": True, "action":
                             "⛔ Two consecutive capped rounds with ZERO file edits — the agent "
                             "is not converging; stopping the code phase (verifying what exists)"})
+                _stop_reason = "no_progress"          # W5
                 break
             if round_i >= max_cont:
                 emit_event(db, run.id, "loop_capped",
                            {"continuations": round_i, "action":
                             "⚠ Continuation budget exhausted — change may be incomplete; verifying anyway"})
+                _stop_reason = "continuations_exhausted"   # W5
                 break
             # Cap hit mid-change → CONTINUE with MEMORY (plan + already-changed + already-read) so the
             # agent finishes the REMAINING work instead of re-exploring. Built from disk + the carried
@@ -1868,6 +1989,28 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
                     "action": "⚠ The agent edited the tree but never ran a build or test "
                               "itself — the verification gate below is the FIRST execution "
                               "of this change"})
+    if _stop_reason:
+        # W5 — the phase stopped SHORT, and its edits stay on disk and travel on to
+        # verify/review. Record what was left behind while the evidence is still at hand,
+        # so the next reader (human or resumed agent) never has to reassemble it from the
+        # event log. Persisted on the run AND emitted: the event is what an operator sees
+        # live, the handoff copy is what survives event scroll and a resume.
+        try:
+            _rdcs = _disk_change_set(db, run)
+            setattr(_rdcs, "plan", getattr(cs, "plan", None) or {})   # legacy-plan fallback
+            _rec = _stop_report(db, run, art, _rdcs,
+                                reason=_stop_reason, rounds=round_i + 1)
+            art["stop_report"] = _rec
+            _h = dict(run.handoff_json or {})
+            _h["stop_report"] = _rec
+            run.handoff_json = _h
+            if db is not None:
+                db.add(run); db.commit()
+            emit_event(db, run.id, "stop_report", _rec)
+        except Exception as _e:  # noqa: BLE001 — a report is never worth failing a phase for
+            logger.warning("stop report failed run=%s: %s", run.id, _e)
+            if db is not None:
+                db.rollback()
     # In-loop deterministic self-correction — a cheap compile→fix BEFORE the authoritative
     # gate, so simple compile errors don't burn a full code-agent + full-build retry round. Gated
     # (default off), fail-open, and NON-DESTRUCTIVE: it restores the agent's edits if it can't reach a

@@ -259,6 +259,24 @@ colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
    tells the distiller to generalise it only if the cause is a property of the repos or
    toolchain — without that, a failed run was distilled from "build errors seen (later
    fixed)" and the one failure that actually stopped it was the only thing missing.
+5. ✅ **Stop report (deterministic, no LLM)** — when the code phase stops SHORT (token
+   budget, continuation budget, two no-progress rounds) its edits stay on disk and travel
+   on to verify/review, and nobody could answer the only question that matters next: how
+   much of this is finished, and what of it can I trust? The evidence existed, scattered
+   across the ratified plan, the disk diff, the last verification payload, the green
+   pointer and the fact sheet — so the next reader reassembled it by hand from the event
+   log, or guessed. `_stop_report` assembles it from HARNESS records only, never the
+   agent's closing prose: planned files (ratified plan via `plan_files.plan_file_entries`,
+   falling back to the agent's own `submit_plan`, then an explicit "none") vs files
+   touched on disk, the gap BOTH ways (`planned_not_touched` — the actionable one — and
+   `touched_not_planned`), last verify verdict, last-green pointer (W3), fact count and
+   execution count (W2). Persisted at `handoff_json["stop_report"]`, emitted as
+   `stop_report`, surfaced in `_run_view`. Honesty properties: `never_built` is a distinct
+   state from `needs_fix` ("NEVER BUILT — trust nothing here until it is verified"), "NO
+   green build was ever reached" is said out loud, file lists cap at 40 with the exact
+   totals kept and the truncation NAMED, paths match by basename (the same coarse matching
+   the review floor uses, since plans name full paths and the diff is repo-relative), and
+   an unknown stop reason degrades to the raw token rather than vanishing. Fail-open.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 

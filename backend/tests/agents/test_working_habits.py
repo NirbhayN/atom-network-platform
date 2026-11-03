@@ -539,3 +539,159 @@ def test_drive_run_does_not_distill_at_the_exit_for_a_completed_run(monkeypatch)
     # COMPLETED is distilled at the push, where the result is actually known — a second
     # call here would double-distill every successful run.
     assert _drive_until(monkeypatch, "completed") == []
+
+
+# ── W5: stop report ──────────────────────────────────────────────────────────────
+
+def _report(monkeypatch, *, planned=("src/A.java", "src/B.java"), touched=("src/A.java",),
+            verification=None, green=None, facts=0, executions=1,
+            reason="continuations_exhausted", rounds=3, agent_plan=None):
+    from app.agents import agentic_orchestrator as O
+    ta = {"files_to_modify": [{"path": p, "intent": "modify"} for p in planned]} if planned else {}
+    monkeypatch.setattr(O, "_latest_ratified_analysis",
+                        lambda db, cr: SimpleNamespace(technical_analysis=ta) if planned else None)
+    run = SimpleNamespace(
+        id="run-x", change_request_id="cr-x", selected_repo_ids=[],
+        handoff_json={"facts": [{"fact": f"f{i}"} for i in range(facts)]})
+    if green is not None:
+        run.handoff_json["last_green_ckpt"] = green
+    art = {"executions": executions}
+    if verification is not None:
+        art["verification"] = verification
+    cs = SimpleNamespace(operations=[SimpleNamespace(path=p, op="modify") for p in touched],
+                         plan=agent_plan or {})
+    return O._stop_report(SimpleNamespace(), run, art, cs, reason=reason, rounds=rounds)
+
+
+def test_stop_report_names_the_planned_files_that_were_never_touched(monkeypatch):
+    rec = _report(monkeypatch, verification={"status": "needs_fix", "errors": ["a", "b"]})
+    assert rec["planned_source"] == "ratified_plan"
+    assert rec["planned"] == 2 and rec["touched"] == 1
+    assert rec["planned_not_touched"] == ["src/B.java"]
+    assert rec["planned_not_touched_total"] == 1
+    assert rec["verify_status"] == "needs_fix" and rec["verify_errors"] == 2
+    assert "ran out of continuation rounds after 3 round(s)" in rec["action"]
+    assert "1 planned file(s) NEVER touched" in rec["action"]
+    assert "last build FAILED (2 error(s))" in rec["action"]
+
+
+def test_stop_report_distinguishes_never_built_from_built_and_failed(monkeypatch):
+    never = _report(monkeypatch, verification=None)
+    assert never["verify_status"] == "never_built"
+    assert "NEVER BUILT — trust nothing here until it is verified" in never["action"]
+    failed = _report(monkeypatch, verification={"status": "needs_fix", "errors": []})
+    assert "NEVER BUILT" not in failed["action"]
+
+
+def test_stop_report_says_so_when_no_green_was_ever_reached(monkeypatch):
+    assert "NO green build was ever reached" in _report(monkeypatch)["action"]
+    with_green = _report(monkeypatch, green={"label": "r2", "at": "t", "files": 5})
+    assert with_green["last_green"] == {"label": "r2", "at": "t", "files": 5}
+    assert "last green at r2 (5 file(s))" in with_green["action"]
+    unlabelled = _report(monkeypatch, green={"label": None, "at": "t", "files": 5})
+    assert "not to a round label" in unlabelled["action"]
+
+
+def test_stop_report_flags_work_the_plan_never_asked_for(monkeypatch):
+    rec = _report(monkeypatch, planned=("src/A.java",), touched=("src/A.java", "src/Z.java"))
+    assert rec["touched_not_planned"] == ["src/Z.java"]
+    assert rec["planned_not_touched"] == [] and "every planned file was touched" in rec["action"]
+
+
+def test_stop_report_falls_back_to_the_agents_own_plan_then_admits_it_has_none(monkeypatch):
+    rec = _report(monkeypatch, planned=(), touched=("src/A.java",),
+                  agent_plan={"files": [{"path": "src/A.java"}, {"path": "src/C.java"}]})
+    assert rec["planned_source"] == "agent_plan" and rec["planned_not_touched"] == ["src/C.java"]
+    blind = _report(monkeypatch, planned=(), touched=("src/A.java",), agent_plan={})
+    assert blind["planned_source"] == "none"
+    assert "no plan on record to compare against" in blind["action"]
+
+
+def test_stop_report_matches_paths_by_basename(monkeypatch):
+    # The plan names a full repo path, the disk change-set is repo-relative — the same
+    # coarse matching the review floor and plan fidelity already use.
+    rec = _report(monkeypatch, planned=("core/src/main/java/A.java",), touched=("src/A.java",))
+    assert rec["planned_not_touched"] == [] and rec["touched_not_planned"] == []
+
+
+def test_stop_report_caps_file_lists_and_names_the_truncation(monkeypatch):
+    rec = _report(monkeypatch, planned=tuple(f"src/F{i}.java" for i in range(60)), touched=())
+    assert len(rec["planned_not_touched"]) == 40
+    assert rec["planned_not_touched_total"] == 60, "the totals stay exact"
+    assert "capped at 40" in rec["truncated"], "a truncated report must never read as complete"
+
+
+def test_stop_report_reports_an_author_that_never_built_its_own_work(monkeypatch):
+    assert "the agent never ran a build or test itself" in _report(monkeypatch, executions=0)["action"]
+    assert "never ran a build" not in _report(monkeypatch, executions=3)["action"]
+
+
+def test_stop_report_counts_the_facts_carried_out_of_the_run(monkeypatch):
+    assert _report(monkeypatch, facts=4)["facts"] == 4
+
+
+def test_every_non_complete_stop_reason_has_human_wording():
+    from app.agents.agentic_orchestrator import _STOP_REASON_WORDS, _stop_report_line
+    for reason in ("budget_exceeded", "no_progress", "continuations_exhausted", "loop_capped"):
+        line = _stop_report_line({"reason": reason, "rounds": 1, "touched": 0,
+                                  "planned_source": "none", "verify_status": "never_built"})
+        assert _STOP_REASON_WORDS[reason] in line
+    # an unknown reason degrades to the raw token rather than vanishing
+    assert "something_new" in _stop_report_line(
+        {"reason": "something_new", "rounds": 1, "touched": 0,
+         "planned_source": "none", "verify_status": "never_built"})
+
+
+def test_phase_code_persists_and_emits_the_stop_report_only_when_it_stopped_short(monkeypatch):
+    from app.agents import agentic_orchestrator as O
+    from app.agents.agentic_subagents import ChangeSet
+
+    def _drive(stopped, max_cont):
+        events = []
+        monkeypatch.setattr(O, "emit_event",
+                            lambda db, rid, kind, payload=None: events.append((kind, payload)))
+        monkeypatch.setattr(O, "_disk_change_count", lambda _run: 1)
+        monkeypatch.setattr(O, "_disk_change_set", lambda db, run: SimpleNamespace(
+            operations=[SimpleNamespace(path="src/A.java", op="modify")]))
+        monkeypatch.setattr(O, "_latest_ratified_analysis", lambda db, cr: SimpleNamespace(
+            technical_analysis={"files_to_modify": [{"path": "src/A.java"},
+                                                    {"path": "src/B.java"}]}))
+        monkeypatch.setattr(settings, "use_self_correction", False)
+        monkeypatch.setattr(settings, "agentic_max_code_continuations", max_cont)
+
+        async def fake(db, **kw):
+            return ChangeSet(operations=[SimpleNamespace(path="src/A.java")],
+                             stopped=stopped, iterations=60, executions=0)
+        monkeypatch.setattr(O.agentic_subagents, "run_code_change", fake)
+        run = SimpleNamespace(id="run-x", change_request_id="cr-x", selected_repo_ids=[],
+                              attempts_json={}, handoff_json={}, parent_run_id=None)
+        db = SimpleNamespace(add=lambda _r: None, commit=lambda: None, rollback=lambda: None,
+                             get=lambda _m, _i: run)
+        art = {"ctx": None, "intent": "x"}
+        asyncio.run(O._phase_code(db, run, art, None))
+        return run, art, events
+
+    run, art, events = _drive("max_iterations", 0)        # capped, no continuations left
+    reports = [p for k, p in events if k == "stop_report"]
+    assert reports and reports[0]["reason"] == "continuations_exhausted"
+    assert reports[0]["planned_not_touched"] == ["src/B.java"]
+    assert run.handoff_json["stop_report"] == reports[0], "survives event scroll + resume"
+    assert art["stop_report"] == reports[0]
+
+    run2, _, events2 = _drive("completed", 2)             # finished clean → no report
+    assert not any(k == "stop_report" for k, _ in events2)
+    assert "stop_report" not in run2.handoff_json
+
+
+def test_run_view_surfaces_the_stop_report(monkeypatch):
+    import app.api.agentic as A
+    monkeypatch.setattr(A, "_push_view", lambda run: {})
+    rec = {"reason": "budget_exceeded", "action": "⏹ …"}
+    run = SimpleNamespace(
+        id="r", change_request_id="c", phase="verify", status="running",
+        manifest_hash=None, cancel_requested=False, error=None, error_code=None,
+        created_by=None, kind="code", parent_run_id=None, selected_repo_ids=[],
+        handoff_json={"stop_report": rec})
+    assert A._run_view(run)["stop_report"] == rec
+    run.handoff_json = {}
+    assert A._run_view(run)["stop_report"] is None, "a clean phase reports nothing"
