@@ -4,9 +4,11 @@
 """Cross-run lessons (gap G2) — the agent writes its own memory.
 
 Within one change, facts ride the fact sheet and the phase handoff; when the run
-completes they die, and the next change relearns "this repo's build needs X" from
-scratch. This module closes the loop: at COMPLETED, an LLM distills the run's
-durable, repo-general gotchas (build quirks, hidden couplings, naming traps —
+ends they die, and the next change relearns "this repo's build needs X" from
+scratch. This module closes the loop: when a run goes terminal — COMPLETED *or*
+FAILED (W4; a run that died on the fourth build failure holds the lesson nobody
+has written down yet) — an LLM distills the run's durable, repo-general gotchas
+(build quirks, hidden couplings, naming traps —
 never change-specific facts) into per-repo lesson lines, stored in the existing
 ``RepoPathContext`` table under ``AGENT_LESSONS.md`` (no migration; same
 context-as-asset channel as MODULE_NOTES). Future runs inject them into the code
@@ -75,10 +77,25 @@ def load_lessons(db, repo_ids: list[str]) -> dict[str, str]:
 
 
 def _material(db, run) -> str:
-    """What the run can teach from: the fact sheet + the failure/review history."""
+    """What the run can teach from: the fact sheet + the failure/review history.
+
+    W4 — for a run that ended FAILED, the single most instructive line is how it died,
+    so the terminal error leads the material. Without it a failed run was distilled from
+    "build errors seen (later fixed)" alone — the one failure that was never fixed, the
+    one that actually stopped the run, was the only thing missing."""
     from app.models.agentic import AgenticEvent
 
     parts: list[str] = []
+    if str(getattr(run, "status", "") or "").lower() == "failed":
+        _err = str(getattr(run, "error", "") or "").strip()
+        _code = str(getattr(run, "error_code", "") or "").strip()
+        if _err or _code:
+            parts.append("THIS RUN FAILED. How it died"
+                         + (f" (code {_code})" if _code else "") + ":\n"
+                         + f"- {_err[:600] or '(no message recorded)'}\n"
+                         "Only generalise this if the cause is a property of the repos or the "
+                         "toolchain that a future run would hit again — not if it was specific "
+                         "to this change.")
     facts = ((run.handoff_json or {}).get("facts") or [])
     if facts:
         parts.append("FACTS the agent recorded during the run:\n" + "\n".join(

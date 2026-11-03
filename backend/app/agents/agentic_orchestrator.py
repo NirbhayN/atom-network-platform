@@ -3486,6 +3486,37 @@ def _lease_lost_set(art: dict) -> bool:
     return bool(ev is not None and ev.is_set())
 
 
+async def _distill_lessons(db, run_id: str, *, outcome: str) -> None:
+    """W4 — distill this run's durable, repo-general gotchas into the cross-run lesson
+    store, for BOTH terminal outcomes.
+
+    Originally this fired only at COMPLETED (F2), which is exactly backwards about where
+    the teaching material is. A completed run mostly confirms what already worked; a run
+    that died on the fourth build failure, a toolchain mismatch or a hidden coupling is
+    the one holding the lesson nobody has written down yet — and losing it means the next
+    change rediscovers it from scratch, at full price.
+
+    Safe to call on ANY terminal run: ``distill_for_run`` opens its own session, returns 0
+    when the run produced no material (so an infra failure that never ran an agent costs
+    no LLM call), dedupes against the existing store, and swallows its own errors. Bounded
+    by a wall-clock timeout and fail-open here as well — memory is a bonus, never a
+    failure mode, least of all on a run that has already failed."""
+    if not getattr(settings, "agentic_lessons_enabled", True):
+        return
+    try:
+        import asyncio as _aio
+        from app.services import agentic_lessons as _AL
+        added = await _aio.wait_for(_AL.distill_for_run(run_id), timeout=90)
+        if added:
+            emit_event(db, run_id, "lessons_learned",
+                       {"count": added, "outcome": outcome,
+                        "action": (f"🧠 {added} lesson(s) saved for future runs on these repos"
+                                   + (" — learned from a FAILED run" if outcome == "failed" else ""))})
+            db.commit()
+    except Exception as e:  # noqa: BLE001 — memory is a bonus, never a failure mode
+        logger.warning("lessons distillation skipped for run=%s (%s): %s", run_id, outcome, e)
+
+
 async def drive_run(db, run_id: str, *, owner: str = "orchestrator", model=None,
                     intent: str = "") -> dict:
     """Drive a run from its current phase to ``awaiting_human_approval`` (or a
@@ -3729,6 +3760,21 @@ async def drive_run(db, run_id: str, *, owner: str = "orchestrator", model=None,
     run = db.get(AgenticRun, run_id)
     logger.info("drive_run: exit run=%s phase=%s status=%s handoff_push=%s",
                 run_id, run.phase, run.status, handoff_push)
+    # W4 — ONE choke point for "this drive ended with the run FAILED", reached by the
+    # phase-iteration ceiling, a non-transient raise, and every mark_terminal(FAILED)
+    # inside _step (TSD gate, XSD build, analysis dead-ends) — those break the phase
+    # loop and fall through here, so none needs its own call. Deliberately AFTER the
+    # lease release: distillation is a bounded LLM call on an isolated session, and
+    # holding a lease across it would block re-drive for no reason. Safe to re-enter —
+    # lessons dedupe on normalized text, so a recovery sweep that re-drives an
+    # already-FAILED run adds nothing twice.
+    #
+    # Two paths deliberately do NOT reach here. The lease-lost early returns: that row
+    # belongs to another driver and we must not touch it. The worker dependency-preflight
+    # failure: it returns before any phase runs, so there is no run material to distill —
+    # and distill_for_run would correctly return 0 anyway.
+    if run is not None and run.status == AgenticStatus.FAILED.value:
+        await _distill_lessons(db, run_id, outcome="failed")
     return {"acquired": True, "phase": run.phase, "status": run.status}
 
 
@@ -4269,6 +4315,10 @@ async def push_run(db, run_id: str, *, owner: str = "orchestrator") -> dict:
         _commit_terminal(db, run_id, msg, error_code=("BASE_DRIFT" if drift else "PREFLIGHT_FAILED"))
         emit_event(db, run_id, "push_preflight_failed", {"reasons": reasons, "drift": drift})
         db.commit()
+        # W4 — terminal FAILED. This run did all its code work and died at the gate, so
+        # it carries a full run's worth of material; base drift in particular is a
+        # recurring, learnable property of how this repo moves.
+        await _distill_lessons(db, run_id, outcome="failed")
         _hb_stop.set(); S.release_lease(db, run_id, owner); db.commit()
         return {"pushed": False, "reason": "; ".join(reasons)}
 
@@ -4282,20 +4332,10 @@ async def push_run(db, run_id: str, *, owner: str = "orchestrator") -> dict:
         logger.info("push_run: run=%s pushing branch=%s", run_id, branch)
         result = _push_all(db, run_id, man, branch, ws_id)
         S.mark_terminal(db, run, AgenticStatus.COMPLETED)
-        # G2 — the run is done: distill its durable, repo-general gotchas into the
-        # cross-run lesson store so the NEXT change starts smarter. Bounded + fail-open;
-        # an isolated session so a distillation hiccup can't touch this transaction.
-        if getattr(settings, "agentic_lessons_enabled", True):
-            try:
-                import asyncio as _aio
-                from app.services import agentic_lessons as _AL
-                _added = await _aio.wait_for(_AL.distill_for_run(run.id), timeout=90)
-                if _added:
-                    emit_event(db, run.id, "lessons_learned",
-                               {"count": _added,
-                                "action": f"🧠 {_added} lesson(s) saved for future runs on these repos"})
-            except Exception as _e:  # noqa: BLE001 — memory is a bonus, never a failure mode
-                logger.warning("lessons distillation skipped for run=%s: %s", run.id, _e)
+        # F2/W4 — the run is done: distill its durable, repo-general gotchas into the
+        # cross-run lesson store so the NEXT change starts smarter. Shared with the
+        # FAILED paths below, which have MORE to teach, not less.
+        await _distill_lessons(db, run.id, outcome="completed")
         emit_event(db, run_id, "completed", {"branch": branch, **result})
         db.commit()
         logger.info("push_run: run=%s COMPLETED branch=%s pushed=%s repos=%s mrs=%s",
@@ -4317,6 +4357,7 @@ async def push_run(db, run_id: str, *, owner: str = "orchestrator") -> dict:
                    {"error": real[:400], "code": (issue.code if issue else "PUSH_FAILED"),
                     "hint": (issue.fix if issue else None), "retryable": True})
         db.commit()
+        await _distill_lessons(db, run_id, outcome="failed")   # W4 — terminal FAILED
         return {"pushed": False, "error": real[:300]}
     finally:
         _hb_stop.set()

@@ -242,6 +242,23 @@ colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
    in `note`) when the run took no checkpoints — Phase A never rounds and checkpointing
    is fail-open — so a rewind target is never invented. Fail-open: a bookkeeping miss
    can't fail a green build.
+4. ✅ **Lessons from FAILED runs** — F2's distillation fired only at COMPLETED, which is
+   backwards about where the teaching material is: a completed run mostly confirms what
+   already worked, while a run that died on the fourth build failure or a toolchain
+   mismatch holds the lesson nobody has written down. Factored into one shared
+   `_distill_lessons(db, run_id, outcome=…)` (fail-open, isolated session, 90s timeout)
+   and called at terminal FAILED as well: `drive_run`'s exit — the single choke point
+   every in-`_step` `mark_terminal(FAILED)` falls through to, placed AFTER the lease
+   release so a bounded LLM call never blocks re-drive — plus both push-failure paths
+   (preflight/base-drift and the push itself). Re-entrant: lessons dedupe on normalized
+   text, so a recovery sweep re-driving a FAILED run adds nothing twice. Deliberately
+   NOT called on the worker dependency-preflight failure (no phase ran, no material) or
+   the lease-lost returns (that row belongs to another driver). The event carries
+   `outcome` and says "learned from a FAILED run" so an operator can see the provenance.
+   `_material` now LEADS with how the run died (`error_code` + `error`, 600 chars) and
+   tells the distiller to generalise it only if the cause is a property of the repos or
+   toolchain — without that, a failed run was distilled from "build errors seen (later
+   fixed)" and the one failure that actually stopped it was the only thing missing.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 

@@ -399,3 +399,143 @@ def test_run_view_surfaces_the_last_green_pointer(monkeypatch):
     run.handoff_json = {}
     assert _run_view(run)["last_green_ckpt"] is None, \
         "no green recorded → no known-good state to fall back to"
+
+
+# ── W4: lessons from FAILED runs ─────────────────────────────────────────────────
+
+def test_failed_run_material_leads_with_how_it_died():
+    from app.services.agentic_lessons import _material
+
+    class _DB:
+        def query(self, *a, **k):
+            return self
+
+        def filter(self, *a, **k):
+            return self
+
+        def order_by(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def all(self):
+            return []
+
+    run = SimpleNamespace(id="r", status="failed", error_code="JDK_MISMATCH",
+                          error="module igw-core needs JDK 8 but the reactor ran 17",
+                          handoff_json={})
+    mat = _material(_DB(), run)
+    assert "THIS RUN FAILED" in mat and "code JDK_MISMATCH" in mat
+    assert "needs JDK 8" in mat
+    assert "property of the repos" in mat, "told to generalise only what recurs"
+    # a completed run says nothing about dying
+    assert "THIS RUN FAILED" not in _material(
+        _DB(), SimpleNamespace(id="r", status="completed", error=None, error_code=None,
+                               handoff_json={}))
+
+
+def _lessons_spy(monkeypatch, *, added=2, boom=False):
+    from app.agents import agentic_orchestrator as O
+    from app.services import agentic_lessons as AL
+    calls, events = [], []
+
+    async def fake(run_id):
+        calls.append(run_id)
+        if boom:
+            raise RuntimeError("distillation exploded")
+        return added
+    monkeypatch.setattr(AL, "distill_for_run", fake)
+    monkeypatch.setattr(O, "emit_event",
+                        lambda db, rid, kind, payload=None: events.append((kind, payload)))
+    monkeypatch.setattr(settings, "agentic_lessons_enabled", True, raising=False)
+    return O, calls, events
+
+
+def test_a_failed_run_teaches_and_the_event_says_so(monkeypatch):
+    O, calls, events = _lessons_spy(monkeypatch)
+    asyncio.run(O._distill_lessons(SimpleNamespace(commit=lambda: None), "run-9",
+                                   outcome="failed"))
+    assert calls == ["run-9"]
+    learned = [p for k, p in events if k == "lessons_learned"]
+    assert learned and learned[0]["count"] == 2 and learned[0]["outcome"] == "failed"
+    assert "FAILED run" in learned[0]["action"], "an operator must see where this came from"
+
+
+def test_a_completed_run_uses_the_same_path_without_the_failed_wording(monkeypatch):
+    O, calls, events = _lessons_spy(monkeypatch)
+    asyncio.run(O._distill_lessons(SimpleNamespace(commit=lambda: None), "run-9",
+                                   outcome="completed"))
+    learned = [p for k, p in events if k == "lessons_learned"][0]
+    assert learned["outcome"] == "completed" and "FAILED" not in learned["action"]
+
+
+def test_distillation_that_learned_nothing_is_silent(monkeypatch):
+    O, calls, events = _lessons_spy(monkeypatch, added=0)
+    asyncio.run(O._distill_lessons(SimpleNamespace(commit=lambda: None), "r", outcome="failed"))
+    assert calls == ["r"] and not events, "0 lessons is not news"
+
+
+def test_distillation_failure_never_propagates(monkeypatch):
+    # Called on a run that has ALREADY failed — raising here would turn a recorded
+    # failure into an unhandled one in the worker.
+    O, _, events = _lessons_spy(monkeypatch, boom=True)
+    asyncio.run(O._distill_lessons(SimpleNamespace(commit=lambda: None), "r", outcome="failed"))
+    assert not events
+
+
+def test_lessons_can_be_switched_off(monkeypatch):
+    O, calls, _ = _lessons_spy(monkeypatch)
+    monkeypatch.setattr(settings, "agentic_lessons_enabled", False, raising=False)
+    asyncio.run(O._distill_lessons(SimpleNamespace(commit=lambda: None), "r", outcome="failed"))
+    assert calls == [], "no LLM call at all when disabled"
+
+
+def _drive_until(monkeypatch, final_status):
+    """Drive the real drive_run over a stubbed _step that lands `final_status`, with the
+    lease / heartbeat / preflight machinery stubbed out. Returns the distill calls."""
+    import threading
+
+    from app.agents import agentic_orchestrator as O
+    from app.models.agentic import AgenticStatus
+    seen = []
+
+    run = SimpleNamespace(id="r", phase="code_change", status="running",
+                          change_request_id="cr", kind="code", selected_repo_ids=[],
+                          attempts_json={}, error=None, error_code=None, handoff_json={})
+    db = SimpleNamespace(get=lambda _m, _i: run, commit=lambda: None,
+                         rollback=lambda: None, refresh=lambda _r: None, add=lambda _r: None)
+
+    async def _step(db_, run_, art, model):
+        run_.status = final_status            # as mark_terminal(FAILED) does, mid-loop
+    monkeypatch.setattr(O, "_step", _step)
+    monkeypatch.setattr(O, "_rehydrate_art", lambda *a, **k: None)
+    monkeypatch.setattr(O, "emit_event", lambda *a, **k: None)
+    monkeypatch.setattr(O, "_start_heartbeat",
+                        lambda rid, owner: (threading.Event(), threading.Event()))
+    monkeypatch.setattr(O.S, "acquire_lease", lambda *a, **k: True)
+    monkeypatch.setattr(O.S, "renew_lease", lambda *a, **k: None)
+    monkeypatch.setattr(O.S, "release_lease", lambda *a, **k: None)
+    monkeypatch.setattr(O.S, "check_cancel", lambda _r: False)
+    monkeypatch.setattr("app.agents.codegen_preflight.check_dependencies", lambda **k: [])
+    monkeypatch.setattr(settings, "agentic_token_budget_hard_cap", 0)
+
+    async def spy(db_, run_id, *, outcome):
+        seen.append((run_id, outcome))
+    monkeypatch.setattr(O, "_distill_lessons", spy)
+
+    asyncio.run(O.drive_run(db, "r", intent="x"))
+    assert AgenticStatus.FAILED.value == "failed"       # pin the literal the tail compares
+    return seen
+
+
+def test_drive_run_distills_once_on_a_terminal_failed_status(monkeypatch):
+    # The choke point: every mark_terminal(FAILED) inside the phase loop breaks out and
+    # falls through to drive_run's exit, so none of those sites needs its own call.
+    assert _drive_until(monkeypatch, "failed") == [("r", "failed")]
+
+
+def test_drive_run_does_not_distill_at_the_exit_for_a_completed_run(monkeypatch):
+    # COMPLETED is distilled at the push, where the result is actually known — a second
+    # call here would double-distill every successful run.
+    assert _drive_until(monkeypatch, "completed") == []
