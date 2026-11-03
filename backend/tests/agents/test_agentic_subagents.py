@@ -215,11 +215,17 @@ def test_run_code_change_produces_changeset(ws, monkeypatch):
         _turn([ToolUseRequest("a", "ast_query", {"repo_id": RID, "path": "src/A.java"})]),
         _turn([ToolUseRequest("e", "edit_file", {"repo_id": RID, "path": "src/A.java",
               "old_string": "int x = 1;", "new_string": "int x = 2;"})]),
+        # W2 ran-before-done: a code round that edits and runs NOTHING is bounced once
+        # for an observed build result, so a well-behaved script runs something before
+        # declaring done (git status is allowlisted and harmless in this fixture).
+        _turn([ToolUseRequest("c", "run_command", {"repo_id": RID,
+              "argv": ["git", "status", "--porcelain"]})]),
         _turn([], text="done", stop="end_turn"),
     ])
     ctx = ContextPack(selected_repo_ids=[RID])
     cs = asyncio.run(S.run_code_change(None, run_id=RUN, ctx=ctx, intent="bump x"))
     assert [o.op for o in cs.operations] == ["modify"]
+    assert cs.executions == 1                      # harness-counted, not model-claimed
     assert cs.reused == [{"thing": "Counter", "decision": "extend"}]
     assert cs.created == []
     assert "int x = 2;" in (ws[0] / "src" / "A.java").read_text()

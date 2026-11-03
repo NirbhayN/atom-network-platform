@@ -66,6 +66,12 @@ class RuntimeResult:
     # (T._stage_schema_write). Non-empty ⇒ the run has a schema change waiting on a
     # human decision; the orchestrator parks at awaiting_schema_amendment.
     schema_amendments: list = field(default_factory=list)
+    # W2 — real executions this batch (run_command + verify_change, harness-counted).
+    # Carried out of the loop so a round that edited files and never built ANYTHING is
+    # reportable after the fact, not only nudgeable during it: the single in-loop nudge
+    # is advisory, so the number is what makes an ignored nudge visible downstream
+    # (the stop report quotes it).
+    executions: int = 0
 
 
 def _head(s: str | None) -> str:
@@ -1005,6 +1011,7 @@ async def run_agent_loop(
     chars_at_anchor = 0
     at_floor_notified = False             # emitted the one-time "context at floor" note this stretch
     nudges_used = 0                       # in-loop convergence nudges spent (bounded)
+    ran_nudge_used = False                # W2: the one ran-before-done nudge, spent?
     iters_since_edit = 0                  # harness-truth exploration counter (code phase)
     prev_ops_n = 0
     facts_rev_pinned = getattr(ctx, "facts_rev", 0)   # fact-sheet revision last pinned into the brief
@@ -1125,7 +1132,8 @@ async def run_agent_loop(
                                      read_files=sorted(ctx.read_files), facts=ctx.facts,
                                      intel_queried=sorted(ctx.intel_queried),
                                      schema_amendments=list(
-                                         (getattr(ctx, "schema_amendments", None) or {}).values()))
+                                         (getattr(ctx, "schema_amendments", None) or {}).values()),
+                                     executions=getattr(ctx, "executions", 0))
             elif _run_total >= _budget_cap * _warn_frac and not getattr(ctx, "_budget_warned", False):
                 ctx._budget_warned = True
                 logger.warning("agent_loop[%s] run=%s token budget at %.0f%% (weighted %d/%d; "
@@ -1404,6 +1412,39 @@ async def run_agent_loop(
         messages.append({"role": "assistant", "content": turn.assistant_content})
 
         if not turn.wants_tools:
+            # W2 — RAN-BEFORE-DONE (deterministic; no LLM, no config gate). The model can
+            # always assert "the change compiles" and, having never run anything, is often
+            # sincere about it — which is exactly why this check counts executions in the
+            # harness instead of reading the prose. Edits on disk + zero run_command/
+            # verify_change calls means the round is about to hand over an UNTESTED claim,
+            # so spend one turn asking for the observed output. Checked BEFORE the
+            # acceptance-predicate nudge below because it is cheaper and more fundamental:
+            # a predicate gap argued from an unbuilt tree is noise either way.
+            #
+            # One shot per loop, on its own budget (not nudges_used — a build that was
+            # never run must not be silently traded away for a predicate nudge). Code phase
+            # only: the read-only analysis/review loops have nothing to build.
+            if (code_phase and ctx.file_ops and not ran_nudge_used
+                    and getattr(ctx, "executions", 0) == 0):
+                ran_nudge_used = True
+                logger.warning("agent_loop[%s] run=%s declared done after %d edit(s) with ZERO "
+                               "runs — nudging for an observed build/test result",
+                               agent_name, run_id, len(ctx.file_ops))
+                _emit("ran_nothing_nudge",
+                      {"iteration": i, "edits": len(ctx.file_ops),
+                       "action": f"🔁 {len(ctx.file_ops)} file(s) edited and nothing ever run — "
+                                 "asking the agent to build/test before it finishes"})
+                messages.append({"role": "user", "content": (
+                    f"[harness record — deterministic] You edited {len(ctx.file_ops)} file(s) "
+                    "this run and called run_command / verify_change ZERO times. Nothing you "
+                    "changed has been compiled or tested, so 'it works' is a prediction, not "
+                    "an observation.\n"
+                    "Run the build (verify_change, or the build/test command via run_command) "
+                    "NOW and QUOTE the output you actually saw — the exit status and any error "
+                    "lines — before you finish. If the build genuinely cannot run in this "
+                    "environment, say so explicitly and name what you saw when you tried; do "
+                    "not finish silently as though it had passed.")})
+                continue
             # In-loop convergence nudge (P1, TodoGate analog): before accepting "done", ask the
             # orchestrator's deterministic completion check (unsatisfied acceptance predicates).
             # Unmet deliverables come back as ONE bounded corrective user turn and the loop
@@ -1549,4 +1590,5 @@ async def run_agent_loop(
                          facts=list(getattr(ctx, "facts", None) or []),
                          intel_queried=sorted(ctx.intel_queried),
                          schema_amendments=list(
-                             (getattr(ctx, "schema_amendments", None) or {}).values()))
+                             (getattr(ctx, "schema_amendments", None) or {}).values()),
+                         executions=getattr(ctx, "executions", 0))

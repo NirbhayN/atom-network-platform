@@ -163,6 +163,20 @@ class RunContext:
     budget_spent: int = 0            # cost-weighted tokens charged to this run so far
     budget_cap: int = 0              # the ENFORCED hard cap (0 = no cap configured)
     budget_used_pct: int | None = None   # None until the loop takes its first reading
+    # W2 — RAN-BEFORE-DONE. How many times this run actually EXECUTED something against
+    # the tree. "I made the change and it builds" is the one claim the model can always
+    # make and never has to back, so the harness counts the executions instead: a code
+    # round with edits and ZERO runs has shipped an untested claim by construction.
+    # Incremented on EXECUTION, so a refused/not-allowlisted command scores nothing —
+    # the counter means "something really ran", not "something was attempted".
+    command_runs: int = 0            # run_command calls that reached the adapter
+    verify_runs: int = 0             # verify_change calls that reached the verifier
+
+    @property
+    def executions(self) -> int:
+        """Total real executions this run (W2). One number for every consumer, so a new
+        execution tool can't quietly fall outside the ran-before-done check."""
+        return int(self.command_runs) + int(self.verify_runs)
 
     def changeset(self) -> list[FileOp]:
         return list(self.file_ops.values())
@@ -1280,6 +1294,7 @@ def run_command(ctx: RunContext, repo_id: str | None = None, argv: list | None =
     except CommandNotAllowed as e:
         raise ToolError(f"command not allowed: {e} — allowed: {', '.join(sorted(ALLOWED_ARGV0))}. "
                         "For file search use the glob/grep TOOLS, not shell find/grep.")
+    ctx.command_runs += 1          # W2: counted only now — a refused command never ran
     out = (res.stdout or "")
     err = (res.stderr or "")
     full = out + (("\n--- stderr ---\n" + err) if err.strip() else "")
@@ -1967,6 +1982,11 @@ def verify_change(ctx: RunContext, repo_id: str | None = None) -> str:
 
     verifier = select_verifier()
     outcome = verifier.verify(ctx.db, ctx.workspace_run_id or ctx.run_id, SimpleNamespace(operations=ops))
+    # W2: the verifier RAN. Counted even on needs_fix/unverified — the point of the
+    # ran-before-done check is whether the agent submitted its work to a real build,
+    # not whether the build liked it. (The early returns above — nothing edited yet —
+    # deliberately don't count: there was nothing to verify.)
+    ctx.verify_runs += 1
     if outcome.status == "unverified":
         # Two very different conditions share this status: a DELIBERATE no-toolchain
         # deferral (CI covers it) vs the verifier failing to run (infra). Telling the

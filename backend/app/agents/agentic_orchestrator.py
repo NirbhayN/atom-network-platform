@@ -1551,6 +1551,7 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
     max_cont = settings.agentic_max_code_continuations
     read_acc: set = set()            # MEMORY across batches: files already explored
     intel_acc: set = set()           # Structural-intel tokens across ALL rounds
+    exec_acc = 0                     # W2: real executions (run_command/verify_change), all rounds
     plan_memory = ""                 # MEMORY: the agent's own plan
     # RESUME WITH MEMORY (§3): a crash / cancel / API-key failure kills the worker, and the
     # code agent's conversation + plan + read-set (kept only on the in-memory `art`) die with
@@ -1699,6 +1700,7 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
                     run.id, round_i + 1, cs.stopped, len(cs.operations), cs.iterations)
         read_acc.update(tuple(x) for x in (cs.read_files or []))
         intel_acc.update(getattr(cs, "intel_queried", None) or [])
+        exec_acc += int(getattr(cs, "executions", 0) or 0)   # W2
         # Any round that made real file edits — completed OR capped — resets the no-progress
         # streak. Without this the counter was only reset inside the max_iterations branch, so a
         # productive completed/redrive round between two empty capped rounds left it intact and
@@ -1848,7 +1850,24 @@ async def _phase_code(db, run: AgenticRun, art: dict, model) -> None:
     # Author-memory for the NEXT entry into this phase (verify-fail retry / review loop-back):
     # the fixer continues this conversation instead of re-deriving the change from summaries.
     art["code_transcript"] = cs.transcript or art.get("code_transcript")
-    emit_event(db, run.id, "change_set", {"ops": len(cs.operations), "stopped": cs.stopped})
+    # W2 — how many times the AUTHOR submitted its own work to something executable,
+    # summed over every round of this phase. Kept on `art` for the stop report; the
+    # verify phase that follows is the authoritative gate either way, so this measures
+    # the author's habit, not the change's validity.
+    art["executions"] = exec_acc
+    emit_event(db, run.id, "change_set", {"ops": len(cs.operations), "stopped": cs.stopped,
+                                          "executions": exec_acc})
+    if _disk_change_count(run) and exec_acc == 0:
+        # The in-loop nudge is advisory (one turn, then the agent's call), and a cap can
+        # end a round before it complies — so a phase CAN finish here having edited the
+        # tree without ever building it. Say so: a needs_fix verdict in the next minute
+        # is then a predictable consequence, not a surprise, and a `verified` one came
+        # from the gate alone with no author self-check behind it.
+        emit_event(db, run.id, "ran_nothing",
+                   {"ops": _disk_change_count(run), "rounds": round_i + 1,
+                    "action": "⚠ The agent edited the tree but never ran a build or test "
+                              "itself — the verification gate below is the FIRST execution "
+                              "of this change"})
     # In-loop deterministic self-correction — a cheap compile→fix BEFORE the authoritative
     # gate, so simple compile errors don't burn a full code-agent + full-build retry round. Gated
     # (default off), fail-open, and NON-DESTRUCTIVE: it restores the agent's edits if it can't reach a

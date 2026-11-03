@@ -207,6 +207,24 @@ colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
    the brief in the persisted transcript is honest even on the turn the cap trips. Inert
    when no cap is configured. `RunContext.budget_{spent,cap,used_pct}` +
    `_budget_state_line` + `_sync_budget_state`.
+2. ✅ **Ran-before-done nudge (deterministic)** — "I made the change and it compiles" is
+   the one claim the model can always make, often sincerely, and never has to back. So
+   the harness counts executions instead of reading the prose: `RunContext.command_runs`
+   / `verify_runs` (+ the `executions` property) increment on EXECUTION, so a
+   non-allowlisted command or a nothing-to-verify call scores zero — the counter means
+   "something really ran". When the code agent declares done with file edits on disk and
+   `executions == 0`, the loop spends ONE turn asking for the observed result: "you edited
+   N file(s) and called run_command / verify_change ZERO times … run the build NOW and
+   QUOTE the output you actually saw — the exit status and any error lines". Checked
+   before the acceptance-predicate nudge (a predicate gap argued from an unbuilt tree is
+   noise either way) and on its own one-shot budget, so a never-run build can't be
+   silently traded away for a predicate nudge. Code phase only; `ran_nothing_nudge` event.
+   Advisory by design — the agent may answer and finish — so the count travels out of the
+   loop (`RuntimeResult.executions` → `ChangeSet.executions` → `art["executions"]`) and
+   `_phase_code` emits `ran_nothing` when the phase ends with disk edits and zero runs:
+   "the verification gate below is the FIRST execution of this change". That makes an
+   ignored nudge visible, and a `needs_fix` a minute later a predictable consequence
+   rather than a surprise.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 

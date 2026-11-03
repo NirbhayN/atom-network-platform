@@ -489,6 +489,11 @@ class ChangeSet:
     # analysis gate to check whether a shared symbol this round touched had
     # callers()/impact_analysis()/symbol_graph() called on it first.
     intel_queried: list = field(default_factory=list)
+    # W2 — real executions this round (run_command + verify_change), harness-counted.
+    # `operations` without `executions` is the signature of an untested change, and the
+    # in-loop nudge that asks for a build is advisory by design — so the number travels
+    # out of the loop to make an IGNORED nudge reportable after the fact.
+    executions: int = 0
 
 
 # ── Prompt assembly ───────────────────────────────────────────────────────────
@@ -1640,4 +1645,5 @@ async def run_code_change(db, *, run_id: str, ctx: ContextPack, xsd_scope: XsdSc
         transcript=res.transcript,
         intel_queried=list(getattr(res, "intel_queried", None) or []),
         schema_amendments=list(getattr(res, "schema_amendments", None) or []),
+        executions=int(getattr(res, "executions", 0) or 0),
     )
