@@ -175,7 +175,14 @@ def _run_view(run: AgenticRun) -> dict:
             "verify_skipped": bool((getattr(run, "handoff_json", None) or {}).get("verify_skipped")),
             # On-demand re-verification result (POST /reverify): {status, at, reason?,
             # gates?, modules_built?, modules_failed?}. None until first re-verify.
-            "last_reverify": (getattr(run, "handoff_json", None) or {}).get("last_reverify")}
+            "last_reverify": (getattr(run, "handoff_json", None) or {}).get("last_reverify"),
+            # W3 — where the last GREEN build was: {label, at, verify_attempt, files,
+            # note}. `label` is the round checkpoint whose round's work is IN the green
+            # tree (null when the run took no checkpoints), and `note` spells out that
+            # returning here after a later regression means reverting to the checkpoint
+            # taken BEFORE that later round. None until a verify first passes — a run
+            # showing none has no known-good state recorded to fall back to.
+            "last_green_ckpt": (getattr(run, "handoff_json", None) or {}).get("last_green_ckpt")}
 
 
 def _approved_xsd_run(db: Session, change_id: str) -> AgenticRun | None:

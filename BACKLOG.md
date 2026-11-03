@@ -225,6 +225,23 @@ colliding with them. Tests: `backend/tests/agents/test_working_habits.py`.
    "the verification gate below is the FIRST execution of this change". That makes an
    ignored nudge visible, and a `needs_fix` a minute later a predictable consequence
    rather than a surprise.
+3. ✅ **Last-green pointer** — a green verify is the most valuable fact a run produces and
+   was the most perishable: it lived in an event payload and a boolean
+   (`handoff_json["verified"]`), neither of which says WHICH round's work was green. A
+   later round then regresses the build and nobody can name the state to go back to — the
+   per-round rewind machinery (F6) existed with no pointer into it. `_phase_verify` now
+   stamps `handoff_json["last_green_ckpt"]` = `{label, at, verify_attempt, files, note}`
+   on every `verified` verdict (intermediate greens and on-demand re-verifies included,
+   not just the final one), emits a `last_green` event, and `_run_view` surfaces it.
+   `_latest_round_ckpt` picks the label numerically so `r10` doesn't rank below `r2`.
+   The semantics are spelled out in the record itself because getting them subtly wrong
+   is worse than having nothing: checkpoints are taken BEFORE each round, so green is the
+   tree AFTER the round that owns `label`, and returning here after a later regression
+   means reverting to the checkpoint taken BEFORE that later round — reverting *to*
+   `label` would undo the very round that made it green. `label` is null (with the reason
+   in `note`) when the run took no checkpoints — Phase A never rounds and checkpointing
+   is fail-open — so a rewind target is never invented. Fail-open: a bookkeeping miss
+   can't fail a green build.
 
 ## Done (commits e8b7ddf, c39a6c9, a42434e)
 

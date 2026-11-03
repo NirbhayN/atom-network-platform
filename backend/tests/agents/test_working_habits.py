@@ -304,3 +304,98 @@ def test_no_nudge_when_nothing_was_edited(monkeypatch):
     _loop(code_phase=True)
     assert not any(k == "ran_nothing_nudge" for k, _ in events), \
         "'no change is needed' is a legitimate finished state"
+
+
+# ── W3: last-green pointer ───────────────────────────────────────────────────────
+
+def test_latest_round_ckpt_sorts_numerically_not_lexically():
+    from app.agents.agentic_orchestrator import _latest_round_ckpt
+    assert _latest_round_ckpt(None) is None
+    assert _latest_round_ckpt({}) is None
+    assert _latest_round_ckpt({"round_ckpts": {}}) is None
+    h = {"round_ckpts": {"r1": {}, "r2": {}, "r10": {}, "r9": {}}}
+    assert _latest_round_ckpt(h) == "r10", "'r10' must not rank below 'r2'"
+
+
+def _verify_run(handoff=None):
+    return SimpleNamespace(id="run-x", handoff_json=handoff, selected_repo_ids=[])
+
+
+def _stamp(monkeypatch, handoff, *, files=7, attempt=2):
+    from app.agents import agentic_orchestrator as O
+    events = []
+    monkeypatch.setattr(O, "emit_event",
+                        lambda db, rid, kind, payload=None: events.append((kind, payload)))
+    monkeypatch.setattr(O, "_disk_change_count", lambda _run: files)
+    run, art = _verify_run(handoff), {}
+    O._stamp_last_green(None, run, art, attempt)
+    return run, art, events
+
+
+def test_green_verify_pins_the_round_whose_work_is_in_the_green_tree(monkeypatch):
+    run, art, events = _stamp(monkeypatch, {"round_ckpts": {"r1": {}, "r2": {}, "r3": {}}})
+    rec = run.handoff_json["last_green_ckpt"]
+    assert rec["label"] == "r3" and rec["files"] == 7 and rec["verify_attempt"] == 2
+    assert rec["at"], "timestamped — 'last' is only meaningful against a clock"
+    # The note must be explicit: reverting TO r3 would undo the round that made it green.
+    assert "AFTER the round" in rec["note"] and "BEFORE that later round" in rec["note"]
+    assert art["last_green_ckpt"] == rec, "in-process consumers (stop report) see it too"
+    green = [p for k, p in events if k == "last_green"]
+    assert green and "after round r3" in green[0]["action"]
+
+
+def test_green_without_any_checkpoint_records_the_fact_and_says_it_is_not_rewindable(monkeypatch):
+    # Phase A never rounds, and checkpointing is fail-open — so a green build with no
+    # label is normal. Record the green, and never invent a rewind target for it.
+    run, _, events = _stamp(monkeypatch, {}, files=2)
+    rec = run.handoff_json["last_green_ckpt"]
+    assert rec["label"] is None and rec["files"] == 2
+    assert "not rewindable by label" in rec["note"]
+    assert [p for k, p in events if k == "last_green"][0]["action"] == \
+        "🟢 Last green: 2 file(s) building"
+
+
+def test_stamping_last_green_preserves_the_rest_of_the_handoff(monkeypatch):
+    run, _, _ = _stamp(monkeypatch, {"round_ckpts": {"r1": {}}, "approach_decision": {"a": 1},
+                                     "xsd_files": [{"path": "x.xsd"}]})
+    assert run.handoff_json["approach_decision"] == {"a": 1}
+    assert run.handoff_json["xsd_files"] == [{"path": "x.xsd"}]
+    assert run.handoff_json["last_green_ckpt"]["label"] == "r1"
+
+
+def test_a_stamp_failure_never_fails_a_green_build(monkeypatch):
+    from app.agents import agentic_orchestrator as O
+    monkeypatch.setattr(O, "_disk_change_count", lambda _run: 1 / 0)
+    O._stamp_last_green(None, _verify_run({}), {}, 1)      # must not raise
+
+
+def test_phase_verify_stamps_only_on_green(monkeypatch):
+    from app.agents import agentic_orchestrator as O
+    seen = []
+    monkeypatch.setattr(O, "emit_event", lambda db, rid, kind, payload=None: None)
+    monkeypatch.setattr(O, "_disk_change_set", lambda db, run: SimpleNamespace(operations=[]))
+    monkeypatch.setattr(O, "_stamp_last_green",
+                        lambda db, run, art, attempt: seen.append(attempt))
+    monkeypatch.setattr(O, "_ws_id", lambda run: "ws")
+    for status in ("needs_fix", "unverified", "verified"):
+        monkeypatch.setattr(O, "select_verifier", lambda s=status: SimpleNamespace(
+            name="local", verify=lambda *a, **k: SimpleNamespace(
+                status=s, gates={}, reason="r", module_results={}, rounds=[])))
+        O._phase_verify(None, _verify_run({}), {})
+    assert seen == [1], "one stamp, for the green verdict only"
+
+
+def test_run_view_surfaces_the_last_green_pointer(monkeypatch):
+    import app.api.agentic as A
+    from app.api.agentic import _run_view
+    monkeypatch.setattr(A, "_push_view", lambda run: {})   # needs a mapped instance
+    rec = {"label": "r2", "at": "2026-11-03T00:00:00", "files": 4}
+    run = SimpleNamespace(
+        id="r", change_request_id="c", phase="verify", status="running",
+        manifest_hash=None, cancel_requested=False, error=None, error_code=None,
+        created_by=None, kind="code", parent_run_id=None, selected_repo_ids=[],
+        handoff_json={"last_green_ckpt": rec})
+    assert _run_view(run)["last_green_ckpt"] == rec
+    run.handoff_json = {}
+    assert _run_view(run)["last_green_ckpt"] is None, \
+        "no green recorded → no known-good state to fall back to"

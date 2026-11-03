@@ -1967,6 +1967,65 @@ async def _inloop_self_correct(db, run: AgenticRun, art: dict) -> None:
                {"success": result.success, "iterations": result.iterations, "action": action})
 
 
+def _latest_round_ckpt(handoff: dict | None) -> str | None:
+    """W3 — the most recent round-checkpoint label ("r1", "r2", …) this run has taken.
+
+    Sorted NUMERICALLY, not lexically: "r10" must not rank below "r2". Returns None when
+    the run took no checkpoints (checkpointing is fail-open, and Phase A never rounds), in
+    which case there is simply no rewind target to name — never a guessed one."""
+    labels = list(((handoff or {}).get("round_ckpts") or {}).keys())
+    if not labels:
+        return None
+
+    def _n(lbl: str) -> tuple[int, str]:
+        digits = "".join(c for c in str(lbl) if c.isdigit())
+        return (int(digits) if digits else -1, str(lbl))
+    return max(labels, key=_n)
+
+
+def _stamp_last_green(db, run: AgenticRun, art: dict, attempt: int) -> None:
+    """W3 — record WHERE the last known-good tree was, the moment the build said so.
+
+    A green verify is the most valuable fact a run ever produces and, until now, the most
+    perishable: it lived in an event payload and in `handoff_json["verified"]`, neither of
+    which says WHICH round's work was green. A later round then regresses the build and
+    nobody can name the state to go back to — the rewind machinery (G6) exists but has no
+    pointer into it.
+
+    Semantics, stated exactly because getting this subtly wrong is worse than not having
+    it: checkpoints are taken BEFORE each round, so green is the tree AFTER the round that
+    owns `label`. Returning to this state after a LATER round goes bad means reverting to
+    the checkpoint taken before THAT later round — not to `label`, which would undo the
+    very round that made it green. The note travels with the record so no reader has to
+    reconstruct that from the code. Fail-open: never breaks the verify phase."""
+    from app.models.base import utcnow
+    try:
+        label = _latest_round_ckpt(getattr(run, "handoff_json", None))
+        rec = {
+            "label": label,
+            "at": utcnow().isoformat(),
+            "verify_attempt": attempt,
+            "files": _disk_change_count(run),
+            "note": ("green is the tree AFTER the round that owns this label; to return "
+                     "here after a later round regresses the build, revert to the "
+                     "checkpoint taken BEFORE that later round, not to this one"
+                     if label else
+                     "no round checkpoint exists for this run (none taken, or a phase "
+                     "that does not round) — the green tree is not rewindable by label"),
+        }
+        h = dict(run.handoff_json or {})
+        h["last_green_ckpt"] = rec
+        run.handoff_json = h
+        art["last_green_ckpt"] = rec
+        emit_event(db, run.id, "last_green",
+                   {**rec,
+                    "action": (f"🟢 Last green: {rec['files']} file(s) building after round "
+                               f"{label}" if label else
+                               f"🟢 Last green: {rec['files']} file(s) building")})
+    except Exception:  # noqa: BLE001 — a bookkeeping miss must never fail a GREEN build
+        logger.debug("last-green stamp failed run=%s", run.id, exc_info=True)
+
+
 def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = True) -> str:
     """AUTHORITATIVE verification through the selected backend, against the DISK
     change-set (ground truth — covers continuations/resumes). Returns the status:
@@ -2022,6 +2081,11 @@ def _phase_verify(db, run: AgenticRun, art: dict, *, app_blast_radius: bool = Tr
         "unverified": f"⚠ Could not verify — {outcome.reason}",
     }.get(outcome.status, outcome.status)
     emit_event(db, run.id, "verification", {**art["verification"], "action": action})
+    if outcome.status == "verified":
+        # W3 — pin the last known-good position while we still know it. Done here rather
+        # than at freeze/approval so EVERY green verdict is recorded, including the
+        # intermediate ones a later round goes on to regress and the on-demand re-verifies.
+        _stamp_last_green(db, run, art, _attempt)
     if outcome.status == "unverified":
         # C4 — an unverified completion must be UNMISSABLE at the approval gate: this
         # change was NEVER BUILT. Persisted on the run (survives event scroll) and
